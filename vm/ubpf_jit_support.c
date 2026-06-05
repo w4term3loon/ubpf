@@ -49,6 +49,10 @@ static void init_seed(void)
 {
     srand((unsigned int)time(NULL));
 }
+static void ensure_seed_initialized(void)
+{
+    /* seeding handled by constructor */
+}
 #else
 // For other platforms, accept potential race condition on first use
 static volatile int seed_initialized = 0;
@@ -191,8 +195,8 @@ ubpf_generate_blinding_constant(void)
         // Seed is initialized at program start via constructor
         random_value = ((uint64_t)rand() << 32) | (uint64_t)rand();
     }
-#elif defined(__APPLE__)
-    // macOS: Use arc4random_buf which is available and doesn't need seeding
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    // macOS/FreeBSD: Use arc4random_buf which is available and doesn't need seeding
     arc4random_buf(&random_value, sizeof(random_value));
 #else
     // Generic fallback: use standard rand (not cryptographically secure)
