@@ -142,7 +142,15 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
         goto out;
     }
 
-    jitted = mmap(0, jitted_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int mmap_prot = PROT_READ | PROT_WRITE;
+#ifdef __CHERI_PURE_CAPABILITY__
+    /* On CheriBSD purecap, capabilities carry permissions — we must
+     * reserve PROT_EXEC at mmap time so the capability includes it,
+     * then use mprotect to narrow back to RX after writing.
+     * Without PROT_EXEC at allocation, mprotect cannot add it later. */
+    mmap_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+#endif
+    jitted = mmap(0, jitted_size, mmap_prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (jitted == MAP_FAILED) {
         *errmsg = ubpf_error("internal uBPF error: mmap failed: %s\n", strerror(errno));
         goto out;
@@ -150,10 +158,12 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
 
     memcpy(jitted, buffer, jitted_size);
 
+#ifndef __CHERI_PURE_CAPABILITY__
     if (mprotect(jitted, jitted_size, PROT_READ | PROT_EXEC) < 0) {
         *errmsg = ubpf_error("internal uBPF error: mprotect failed: %s\n", strerror(errno));
         goto out;
     }
+#endif
 
     vm->jitted = jitted;
     vm->jitted_size = jitted_size;
