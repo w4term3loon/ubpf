@@ -153,6 +153,21 @@ ubpf_jit_update_helper_arm64(
     size_t size,
     uint32_t offset);
 
+// arm64 CHERI (Morello purecap) — uses capability-aware prologue/epilogue
+struct ubpf_jit_result
+ubpf_translate_arm64_cheri(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);
+bool
+ubpf_jit_update_dispatcher_arm64_cheri(
+    struct ubpf_vm* vm, external_function_dispatcher_t new_dispatcher, uint8_t* buffer, size_t size, uint32_t offset);
+bool
+ubpf_jit_update_helper_arm64_cheri(
+    struct ubpf_vm* vm,
+    extended_external_helper_t new_helper,
+    unsigned int idx,
+    uint8_t* buffer,
+    size_t size,
+    uint32_t offset);
+
 // x86_64
 struct ubpf_jit_result
 ubpf_translate_x86_64(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, enum JitMode jit_mode);

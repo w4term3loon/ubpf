@@ -59,6 +59,22 @@ ubpf_toggle_bounds_check(struct ubpf_vm* vm, bool enable)
     return old;
 }
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+void
+ubpf_use_stock_jit(struct ubpf_vm* vm, bool use_stock)
+{
+    if (use_stock) {
+        vm->jit_translate = ubpf_translate_arm64;
+        vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64;
+        vm->jit_update_helper = ubpf_jit_update_helper_arm64;
+    } else {
+        vm->jit_translate = ubpf_translate_arm64_cheri;
+        vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64_cheri;
+        vm->jit_update_helper = ubpf_jit_update_helper_arm64_cheri;
+    }
+}
+#endif
+
 bool
 ubpf_toggle_constant_blinding(struct ubpf_vm* vm, bool enable)
 {
@@ -128,6 +144,10 @@ ubpf_create(void)
     vm->jit_translate = ubpf_translate_x86_64;
     vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_x86_64;
     vm->jit_update_helper = ubpf_jit_update_helper_x86_64;
+#elif defined(__CHERI_PURE_CAPABILITY__)
+    vm->jit_translate = ubpf_translate_arm64_cheri;
+    vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64_cheri;
+    vm->jit_update_helper = ubpf_jit_update_helper_arm64_cheri;
 #elif defined(__aarch64__) || defined(_M_ARM64)
     vm->jit_translate = ubpf_translate_arm64;
     vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64;

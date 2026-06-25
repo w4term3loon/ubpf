@@ -146,6 +146,11 @@ extern "C"
     bool
     ubpf_toggle_bounds_check(struct ubpf_vm* vm, bool enable);
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+    void
+    ubpf_use_stock_jit(struct ubpf_vm* vm, bool use_stock);
+#endif
+
     /**
      * @brief Enable / disable constant blinding in the JIT compiler.
      * Constant blinding is a security hardening technique that prevents JIT spray attacks by
