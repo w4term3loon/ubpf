@@ -687,7 +687,14 @@ emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 
     DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
     DECLARE_PATCHABLE_SPECIAL_TARGET(enter_tgt, Enter);
-    emit_unconditionalbranch_immediate(state, UBR_BL, enter_tgt);
+    /* CHERI: use B instead of BL — BL writes a sealed sentry to C30 from
+     * mmap'd PROT_EXEC memory, which traps with SIGPROT on QEMU Morello.
+     * B is a plain branch with no link-register side effect. This is safe
+     * because the uBPF loader rejects programs that don't end with EXIT,
+     * so every valid program reaches the epilogue via the eBPF exit opcode's
+     * own branch, not via the link register. The B exit below is dead code
+     * that only runs for invalid programs (defensive, never reached). */
+    emit_unconditionalbranch_immediate(state, UBR_B, enter_tgt);
     emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
     state->entry_loc = state->offset;
 }
@@ -1321,8 +1328,11 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         if (i == 0 || vm->int_funcs[i]) {
             size_t prolog_start = state->offset;
             emit_movewide_immediate(state, true, temp_register, ubpf_stack_usage_for_local_func(vm, i));
+            /* CHERI: skip stack store — stores from mmap'd PROT_EXEC memory
+             * crash on QEMU Morello. The stack usage value is only needed for
+             * local function calls, which are not yet supported in the CHERI
+             * backend. The sub csp is kept for stack frame setup. */
             emit_cheri_addsub_csp_immediate(state, AS_SUB, 16);
-            emit_loadstorepair_immediate(state, LSP_STPX, temp_register, temp_register, SP, 0);
             // Record the size of the prolog so that we can calculate offset when doing a local call.
             if (state->bpf_function_prolog_size == 0) {
                 state->bpf_function_prolog_size = state->offset - prolog_start;
@@ -1553,10 +1563,12 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             }
             break;
         }
-        case EBPF_OP_EXIT:
-            emit_cheri_addsub_csp_immediate(state, AS_ADD, 16);
-            emit_cheri_ret_c30(state);
+        case EBPF_OP_EXIT: {
+            /* CHERI: branch to epilogue (which deallocates stack and does ret c30). */
+            DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
+            emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
             break;
+        }
 
         case EBPF_OP_STXW:
         case EBPF_OP_STXH:
