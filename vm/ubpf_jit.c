@@ -142,6 +142,28 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
         goto out;
     }
 
+#ifdef __CHERI_PURE_CAPABILITY__
+    /* CHERI M3: allocate a separate PROT_READ|PROT_WRITE page for the
+     * eBPF stack. This avoids the W^X SIGPROT crash that occurs when
+     * stores are executed from mmap'd PROT_EXEC memory on QEMU Morello.
+     * Patch the literal pool entry in the JIT buffer with the stack top
+     * address (base + size), since eBPF stack grows downward from R10. */
+    void* ebpf_stack_page = NULL;
+    if (mode == BasicJitMode && vm->jitted_result.stack_base_offset > 0) {
+        ebpf_stack_page = mmap(0, UBPF_EBPF_STACK_SIZE,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ebpf_stack_page == MAP_FAILED) {
+            *errmsg = ubpf_error("internal uBPF error: stack mmap failed: %s\n", strerror(errno));
+            goto out;
+        }
+        vm->ebpf_stack_page = ebpf_stack_page;
+        uint64_t stack_top = (uint64_t)ebpf_stack_page + UBPF_EBPF_STACK_SIZE;
+        uint32_t off = vm->jitted_result.stack_base_offset;
+        memcpy(buffer + off, &stack_top, sizeof(uint64_t));
+    }
+#endif
+
     int mmap_prot = PROT_READ | PROT_WRITE;
 #ifdef __CHERI_PURE_CAPABILITY__
     /* On CheriBSD purecap, capabilities carry permissions — we must

@@ -58,6 +58,7 @@ enum SpecialTarget
     Retpoline,
     ExternalDispatcher,
     LoadHelperTable,
+    StackBase,
 };
 
 struct RegularTarget
@@ -144,6 +145,10 @@ struct jit_state
      * registered handler. See commentary in ubpf_jit_x86_64.c.
      */
     uint32_t helper_table_loc;
+    /* CHERI: offset to the literal pool entry holding the eBPF stack
+     * base address (top of stack, since eBPF stack grows downward).
+     * Patched by ubpf_compile_ex after mmap'ing a separate stack page. */
+    uint32_t stack_base_loc;
     enum JitProgress jit_status;
     enum JitMode jit_mode;
     struct patchable_relative* jumps;

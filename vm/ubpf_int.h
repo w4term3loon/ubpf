@@ -43,6 +43,9 @@ struct ubpf_jit_result
 {
     uint32_t external_dispatcher_offset;
     uint32_t external_helper_offset;
+    /* CHERI: offset in the JIT buffer where the eBPF stack base
+     * address is stored (literal pool entry). Patched after mmap. */
+    uint32_t stack_base_offset;
     upbf_jit_result_t compile_result;
     enum JitMode jit_mode;
     char* errmsg;
@@ -74,6 +77,9 @@ struct ubpf_vm
     size_t jitted_size;
     size_t jitter_buffer_size;
     struct ubpf_jit_result jitted_result;
+    /* CHERI M3: separately mmap'd eBPF stack page (PROT_READ|PROT_WRITE
+     * only, no PROT_EXEC). Freed in ubpf_destroy. */
+    void* ebpf_stack_page;
 
     extended_external_helper_t* ext_funcs;
     bool* int_funcs;

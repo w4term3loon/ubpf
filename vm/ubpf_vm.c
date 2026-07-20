@@ -168,6 +168,11 @@ void
 ubpf_destroy(struct ubpf_vm* vm)
 {
     ubpf_unload_code(vm);
+#ifdef __CHERI_PURE_CAPABILITY__
+    if (vm->ebpf_stack_page) {
+        munmap(vm->ebpf_stack_page, UBPF_EBPF_STACK_SIZE);
+    }
+#endif
     free(vm->int_funcs);
     free(vm->ext_funcs);
     free(vm->ext_func_names);

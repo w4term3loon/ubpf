@@ -663,21 +663,33 @@ static void
 emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 {
     /*
-     * CHERI minimal prologue: no memory stores, no SP reads.
+     * CHERI M3 prologue: decoupled stack mapping.
      *
-     * On QEMU Morello purecap, ANY store instruction (A64 or Morello)
-     * executed from mmap'd PROT_EXEC memory crashes with SIGPROT.
-     * Additionally, A64 instructions that read SP (X31) in non-add/sub
-     * contexts may also crash. This prologue does only:
-     *   1. Morello sub csp, csp, #ubpf_stack_size  (allocate eBPF stack)
-     *   2. bl enter / b exit                      (transfer control)
+     * The eBPF stack is allocated on a SEPARATE mmap'd page with
+     * PROT_READ|PROT_WRITE (no PROT_EXEC). This avoids the W^X
+     * SIGPROT crash that occurs when stores are executed from
+     * mmap'd PROT_EXEC memory on QEMU Morello.
+     *
+     * The stack base address (top of stack, since eBPF grows downward)
+     * is embedded in the JIT literal pool and loaded into R10 via
+     * a PC-relative literal load (ldr).  A64 loads from the code page
+     * go through PCC which has PERMIT_LOAD, so the literal load works.
+     *
+     * eBPF stack load/store instructions use the R10-mapped register
+     * (R23) as the base. A64 ldr/str through X23 go through DDC,
+     * not CSP — bypassing the CSP-specific crash.
+     *
+     * The JIT caller (ubpf_compile_ex) patches the literal pool entry
+     * with the actual stack address after mmap'ing the stack page.
      */
     state->stack_size = 0;
 
     if (state->jit_mode == BasicJitMode) {
-        /* CHeri: Morello sub csp for eBPF stack (no R10 setup for now) */
-        emit_cheri_addsub_csp_immediate(state, AS_SUB, ubpf_stack_size);
+        /* Load eBPF stack top (R10) from literal pool. */
+        DECLARE_PATCHABLE_SPECIAL_TARGET(stack_base_tgt, StackBase);
+        emit_loadstore_literal(state, LS_LDRL, map_register(10), stack_base_tgt);
     } else {
+        /* Extended mode: stack passed via R2/R3 as before. */
         emit_addsub_immediate(state, true, AS_ADD, map_register(10), R2, 0);
         emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), R3);
     }
@@ -687,13 +699,6 @@ emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 
     DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
     DECLARE_PATCHABLE_SPECIAL_TARGET(enter_tgt, Enter);
-    /* CHERI: use B instead of BL — BL writes a sealed sentry to C30 from
-     * mmap'd PROT_EXEC memory, which traps with SIGPROT on QEMU Morello.
-     * B is a plain branch with no link-register side effect. This is safe
-     * because the uBPF loader rejects programs that don't end with EXIT,
-     * so every valid program reaches the epilogue via the eBPF exit opcode's
-     * own branch, not via the link register. The B exit below is dead code
-     * that only runs for invalid programs (defensive, never reached). */
     emit_unconditionalbranch_immediate(state, UBR_B, enter_tgt);
     emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
     state->entry_loc = state->offset;
@@ -709,9 +714,8 @@ emit_jit_epilogue(struct jit_state* state)
         emit_logical_register(state, true, LOG_ORR, R0, RZ, map_register(0));
     }
 
-    /* CHeri: deallocate eBPF stack via Morello add csp */
-    emit_cheri_addsub_csp_immediate(state, AS_ADD, UBPF_EBPF_STACK_SIZE);
-
+    /* CHERI M3: no stack deallocation needed — the eBPF stack lives on
+     * a separate page managed by ubpf_compile_ex, not on CSP. */
     /* CHeri: Morello ret c30 — capability-aware return */
     emit_cheri_ret_c30(state);
 }
@@ -1763,6 +1767,18 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
 
     emit_jit_epilogue(state);
 
+    /* CHERI M3: emit literal pool entry for eBPF stack base address.
+     * This 8-byte placeholder (0) is patched by ubpf_compile_ex
+     * with the actual stack top address after mmap'ing the stack page. */
+    if (state->jit_mode == BasicJitMode) {
+        uint8_t zero = 0;
+        int adj = (4 - (state->offset % 4)) % 4;
+        for (int i = 0; i < adj; i++) emit_bytes(state, &zero, 1);
+        state->stack_base_loc = state->offset;
+        uint64_t placeholder = 0;
+        emit_bytes(state, &placeholder, sizeof(uint64_t));
+    }
+
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, (uint64_t)vm->dispatcher);
     state->helper_table_loc = emit_helper_table(state, vm);
 
@@ -1871,9 +1887,10 @@ resolve_loads(struct jit_state* state)
         struct patchable_relative jump = state->loads[i];
 
         int32_t target_loc = 0;
-        // Right now it is only possible to load from the external dispatcher.
         if (jump.target.is_special && jump.target.target.special == ExternalDispatcher) {
             target_loc = state->dispatcher_loc;
+        } else if (jump.target.is_special && jump.target.target.special == StackBase) {
+            target_loc = state->stack_base_loc;
         } else {
             return false;
         }
@@ -1984,6 +2001,7 @@ ubpf_translate_arm64_cheri(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, en
     *size = state.offset;
     compile_result.external_dispatcher_offset = state.dispatcher_loc;
     compile_result.external_helper_offset = state.helper_table_loc;
+    compile_result.stack_base_offset = state.stack_base_loc;
 
 out:
     release_jit_state_result(&state, &compile_result);
