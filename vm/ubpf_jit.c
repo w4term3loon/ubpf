@@ -24,10 +24,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
+#if defined(__CHERI_PURE_CAPABILITY__)
+#include <cheriintrin.h>
+#include <dlfcn.h>
+#endif
 #include "ubpf_int.h"
 
 int
@@ -93,6 +98,132 @@ ubpf_jit_update_helper_null(
     return false;
 }
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+static void
+ubpf_close_cheri_objjit(struct ubpf_vm* vm)
+{
+    if (vm->cheri_objjit_handle) {
+        dlclose(vm->cheri_objjit_handle);
+        vm->cheri_objjit_handle = NULL;
+    }
+}
+
+static bool
+ubpf_cheri_objjit_supported_context_load(const struct ubpf_vm* vm, int16_t* offset_out, char** errmsg)
+{
+    uint8_t context_reg = 1;
+    uint32_t load_pc = 0;
+    uint32_t exit_pc = 1;
+
+    if (vm->num_insts == 3) {
+        struct ebpf_inst alias = ubpf_fetch_instruction(vm, 0);
+        if (alias.opcode != EBPF_OP_MOV64_REG || alias.src != 1 || alias.dst < 2 || alias.dst > 9 ||
+            alias.offset != 0 || alias.imm != 0) {
+            *errmsg = ubpf_error(
+                "CHERI object JIT only supports a leading rN = r1 alias before context loads");
+            return false;
+        }
+        context_reg = alias.dst;
+        load_pc = 1;
+        exit_pc = 2;
+    } else if (vm->num_insts != 2) {
+        *errmsg = ubpf_error(
+            "CHERI object JIT only supports direct or single-alias context-load programs");
+        return false;
+    }
+
+    struct ebpf_inst load = ubpf_fetch_instruction(vm, load_pc);
+    struct ebpf_inst exit_inst = ubpf_fetch_instruction(vm, exit_pc);
+
+    if (load.opcode != EBPF_OP_LDXDW || load.dst != 0 || load.src != context_reg || load.imm != 0) {
+        *errmsg = ubpf_error(
+            "CHERI object JIT only supports r0 = *(u64 *)(context + offset); got opcode %02x dst %u src %u imm %d",
+            load.opcode,
+            load.dst,
+            load.src,
+            load.imm);
+        return false;
+    }
+
+    if (exit_inst.opcode != EBPF_OP_EXIT || exit_inst.dst != 0 || exit_inst.src != 0 || exit_inst.offset != 0 ||
+        exit_inst.imm != 0) {
+        *errmsg = ubpf_error("CHERI object JIT requires a plain EXIT after the context load");
+        return false;
+    }
+
+    if (load.offset < 0) {
+        *errmsg = ubpf_error("CHERI object JIT does not yet support negative context offsets");
+        return false;
+    }
+    if ((load.offset % 8) != 0) {
+        *errmsg = ubpf_error("CHERI object JIT context-load offset must be 8-byte aligned");
+        return false;
+    }
+    if ((load.offset / 8) >= 0x1000) {
+        *errmsg = ubpf_error("CHERI object JIT context-load offset is too large for the current Morello encoding");
+        return false;
+    }
+
+    *offset_out = load.offset;
+    return true;
+}
+
+static ubpf_jit_ex_fn
+ubpf_compile_cheri_objjit(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
+{
+    if (mode != BasicJitMode) {
+        return NULL;
+    }
+
+    int16_t offset = 0;
+    char* shape_error = NULL;
+    if (!ubpf_cheri_objjit_supported_context_load(vm, &offset, &shape_error)) {
+        free(shape_error);
+        return NULL;
+    }
+
+    const char* dir = getenv("UBPF_CHERI_OBJJIT_DIR");
+    if (!dir || dir[0] == '\0') {
+        dir = "/mnt";
+    }
+
+    char path[256];
+    int written = snprintf(path, sizeof(path), "%s/cheri_objjit_offset_%d.so", dir, (int)offset);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        *errmsg = ubpf_error("CHERI object JIT artifact path is too long");
+        return NULL;
+    }
+
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        *errmsg = ubpf_error("CHERI object JIT failed to dlopen %s: %s", path, dlerror());
+        return NULL;
+    }
+
+    dlerror();
+    void* entry = dlsym(handle, "bpf_entry");
+    const char* dlsym_error = dlerror();
+    if (dlsym_error) {
+        *errmsg = ubpf_error("CHERI object JIT failed to resolve bpf_entry in %s: %s", path, dlsym_error);
+        dlclose(handle);
+        return NULL;
+    }
+
+    ubpf_close_cheri_objjit(vm);
+    vm->cheri_objjit_handle = handle;
+    vm->jitted_mapping = NULL;
+    vm->jitted = (ubpf_jit_ex_fn)entry;
+    vm->jitted_size = 0;
+    vm->jitted_result.compile_result = UBPF_JIT_COMPILE_SUCCESS;
+    vm->jitted_result.jit_mode = mode;
+    vm->jitted_result.errmsg = NULL;
+    vm->jitted_result.external_dispatcher_offset = 0;
+    vm->jitted_result.external_helper_offset = 0;
+    *errmsg = NULL;
+    return vm->jitted;
+}
+#endif
+
 int
 ubpf_set_jit_code_size(struct ubpf_vm* vm, size_t code_size)
 {
@@ -118,8 +249,21 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
         return vm->jitted;
     }
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+    if (vm->cheri_objjit_handle) {
+        ubpf_close_cheri_objjit(vm);
+        vm->jitted = NULL;
+        vm->jitted_mapping = NULL;
+        vm->jitted_size = 0;
+    } else
+#endif
     if (vm->jitted) {
+#if defined(__CHERI_PURE_CAPABILITY__)
+        munmap(vm->jitted_mapping, vm->jitted_size);
+        vm->jitted_mapping = NULL;
+#else
         munmap(vm->jitted, vm->jitted_size);
+#endif
         vm->jitted = NULL;
         vm->jitted_size = 0;
     }
@@ -130,6 +274,19 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
         *errmsg = ubpf_error("code has not been loaded into this VM");
         return NULL;
     }
+
+#if defined(__CHERI_PURE_CAPABILITY__)
+    const char* use_objjit = getenv("UBPF_CHERI_USE_OBJJIT");
+    if (use_objjit && strcmp(use_objjit, "1") == 0) {
+        ubpf_jit_ex_fn objjit = ubpf_compile_cheri_objjit(vm, errmsg, mode);
+        if (objjit) {
+            return objjit;
+        }
+        if (*errmsg) {
+            return NULL;
+        }
+    }
+#endif
 
     jitted_size = vm->jitter_buffer_size;
     buffer = calloc(jitted_size, 1);
@@ -165,12 +322,14 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
 #endif
 
     int mmap_prot = PROT_READ | PROT_WRITE;
+    int mprotect_prot = PROT_READ | PROT_EXEC;
 #ifdef __CHERI_PURE_CAPABILITY__
-    /* On CheriBSD purecap, capabilities carry permissions — we must
-     * reserve PROT_EXEC at mmap time so the capability includes it,
-     * then use mprotect to narrow back to RX after writing.
-     * Without PROT_EXEC at allocation, mprotect cannot add it later. */
-    mmap_prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+    /* CheriBSD purecap permissions are carried by capabilities. Reserve the
+     * complete RWX+CAP maximum at allocation time, then narrow the mapping to
+     * RX+CAP after copying the translated code. */
+    mmap_prot = PROT_READ | PROT_WRITE | PROT_EXEC | PROT_CAP;
+    mprotect_prot = PROT_READ | PROT_EXEC | PROT_CAP;
+    mmap_prot |= PROT_MAX(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_CAP);
 #endif
     jitted = mmap(0, jitted_size, mmap_prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (jitted == MAP_FAILED) {
@@ -180,14 +339,17 @@ ubpf_compile_ex(struct ubpf_vm* vm, char** errmsg, enum JitMode mode)
 
     memcpy(jitted, buffer, jitted_size);
 
-#ifndef __CHERI_PURE_CAPABILITY__
-    if (mprotect(jitted, jitted_size, PROT_READ | PROT_EXEC) < 0) {
+    if (mprotect(jitted, jitted_size, mprotect_prot) < 0) {
         *errmsg = ubpf_error("internal uBPF error: mprotect failed: %s\n", strerror(errno));
         goto out;
     }
-#endif
 
+#ifdef __CHERI_PURE_CAPABILITY__
+    vm->jitted_mapping = jitted;
+    vm->jitted = (ubpf_jit_ex_fn)cheri_sentry_create((void*)((uintptr_t)jitted | 1U));
+#else
     vm->jitted = jitted;
+#endif
     vm->jitted_size = jitted_size;
 
 out:
@@ -216,7 +378,11 @@ ubpf_copy_jit(struct ubpf_vm* vm, void* buffer, size_t size, char** errmsg)
     }
 
     // All good. Do the copy!
+#if defined(__CHERI_PURE_CAPABILITY__)
+    memcpy(buffer, vm->jitted_mapping, vm->jitted_size);
+#else
     memcpy(buffer, vm->jitted, vm->jitted_size);
+#endif
     *errmsg = NULL;
     return (ubpf_jit_fn)buffer;
 }

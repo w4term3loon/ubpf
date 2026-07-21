@@ -38,17 +38,16 @@
  *   - A64 `add sp, sp, #imm`  →  Morello `add csp, csp, #imm`
  *   - A64 `ret x30`           →  Morello `ret c30`
  *
- * All other instructions (ALU, load/store, branches) remain A64 encodings.
- * Data loads/stores through the stack pointer are bounds-checked by the
- * Morello hardware against CSP's capability bounds — this is the runtime
- * safety enforcement that replaces the missing verifier.
+ * Most scalar ALU and branch instructions remain A64 encodings. Memory
+ * operations are intentionally fail-closed unless they are part of the
+ * narrow context-capability load subset implemented below. This backend does
+ * not replace the eBPF verifier; it is an experimental second enforcement
+ * layer for bytecode that has already been admitted.
  *
- * Limitation: capability store/load instructions (`stp c`, `ldr c`) crash
- * when executed from mmap'd PROT_EXEC memory on QEMU Morello, so callee-
- * saved registers are spilled using A64 `stp x` (64-bit data stores) rather
- * than capability spills.  The register values lose their capability tags on
- * spill and regain only the 64-bit address on reload — acceptable for
- * scalar callee-saved registers, but a known limitation for future work.
+ * Anonymous mmap code must be entered through a capmode function address
+ * (`addr | 1`) so CheriBSD sets Morello C64 state. Once entered in C64 mode,
+ * this backend can use capability stack operations and capability-relative
+ * data loads from generated code.
  */
 
 #include <stdint.h>
@@ -105,18 +104,13 @@ enum Registers
     RZ = 31
 };
 
-// Callee saved registers - this must be a multiple of two because of how we save the stack later on.
-static enum Registers callee_saved_registers[] = {R19, R20, R21, R22, R23, R24, R25, R26};
-// Caller saved registers (and parameter registers)
-// static enum Registers caller_saved_registers[] = {R0, R1, R2, R3, R4};
-// Temp register for immediate generation
-static enum Registers temp_register = R24;
-// Temp register for division results
-static enum Registers temp_div_register = R25;
-// Temp register for load/store offsets
-static enum Registers offset_register = R26;
-// Special register for external dispatcher context.
-static enum Registers VOLATILE_CTXT = R26;
+// The restricted CHERI backend currently keeps BPF state and temporaries in
+// caller-saved registers. If future work uses C ABI callee-saved registers,
+// they must be saved and restored as capabilities.
+static enum Registers temp_register = R11;
+static enum Registers temp_div_register = R12;
+static enum Registers offset_register = R13;
+static enum Registers VOLATILE_CTXT = R14;
 
 // Number of eBPF registers
 #define REGISTER_MAP_SIZE 11
@@ -125,10 +119,10 @@ static enum Registers VOLATILE_CTXT = R26;
 //   BPF        Arm64       Usage
 //   r0         r5          Return value from calls (see note)
 //   r1 - r5    r0 - r4     Function parameters, caller-saved
-//   r6 - r10   r19 - r23   Callee-saved registers
-//              r24         Temp - used for generating 32-bit immediates
-//              r25         Temp - used for modulous calculations
-//              r26         Temp - used for large load/store offsets
+//   r6 - r10   r6 - r10    Caller-saved registers in the restricted CHERI backend
+//              r11         Temp - used for generating 32-bit immediates
+//              r12         Temp - used for modulus calculations
+//              r13         Temp - used for large load/store offsets
 //
 // Note that the AArch64 ABI uses r0 both for function parameters and result.  We use r5 to hold
 // the result during the function and do an extra final move at the end of the function to copy the
@@ -140,11 +134,18 @@ static enum Registers register_map[REGISTER_MAP_SIZE] = {
     R2,
     R3,
     R4, // parameters
-    R19,
-    R20,
-    R21,
-    R22,
-    R23, // callee-saved
+    R6,
+    R7,
+    R8,
+    R9,
+    R10,
+};
+
+enum CheriRegKind
+{
+    CHERI_REG_SCALAR,
+    CHERI_REG_CONTEXT_CAP,
+    CHERI_REG_STACK_CAP,
 };
 
 /* Return the Arm64 register for the given eBPF register */
@@ -261,25 +262,69 @@ emit_addsub_register(
  * update the capability stack pointer (CSP).
  *
  * Encodings verified from compiler output on CheriBSD purecap QEMU:
- *   sub csp, csp, #imm  →  0x02800000 | (imm << 10) | (rn << 5) | rd
- *   add csp, csp, #imm  →  0x02000000 | (imm << 10) | (rn << 5) | rd
- *   ret c30              →  0xc2c253c0
+ *   sub cd, cn, #imm      -> 0x02800000 | (imm << 10) | (cn << 5) | cd
+ *   add cd, cn, #imm      -> 0x02000000 | (imm << 10) | (cn << 5) | cd
+ *   stp ct, ct2, [cn,#n]  -> 0x42800000 | ((n / 16) << 15) | (ct2 << 10) | (cn << 5) | ct
+ *   ldp ct, ct2, [cn,#n]  -> 0x42c00000 | ((n / 16) << 15) | (ct2 << 10) | (cn << 5) | ct
+ *   scbnds cd, cn, #imm   -> 0xc2c03800 | enc(imm) | (cn << 5) | cd
+ *   ret c30               -> 0xc2c253c0
  */
 
 static void
-emit_cheri_addsub_csp_immediate(struct jit_state* state, enum AddSubOpcode op, uint32_t imm12)
+emit_cheri_addsub_cap_immediate(
+    struct jit_state* state, enum AddSubOpcode op, enum Registers cd, enum Registers cn, uint32_t imm12)
 {
-    /* Morello SUB/ADD CSP, CSP, #imm12.
+    /* Morello SUB/ADD Cd, Cn, #imm12.
      * The Morello capability add/sub immediate does NOT support the
      * 12-bit shift that A64 add/sub does. For values >= 0x1000, split
      * into multiple sub/add instructions.
      */
     uint32_t base = (op == AS_SUB) ? 0x02800000U : 0x02000000U;
     while (imm12 >= 0x1000) {
-        emit_instruction(state, base | (0xfff << 10) | (SP << 5) | SP);
+        emit_instruction(state, base | (0xfff << 10) | (cn << 5) | cd);
         imm12 -= 0xfff;
+        cn = cd;
     }
-    emit_instruction(state, base | (imm12 << 10) | (SP << 5) | SP);
+    emit_instruction(state, base | (imm12 << 10) | (cn << 5) | cd);
+}
+
+static void
+emit_cheri_addsub_csp_immediate(struct jit_state* state, enum AddSubOpcode op, uint32_t imm12)
+{
+    emit_cheri_addsub_cap_immediate(state, op, SP, SP, imm12);
+}
+
+static void
+emit_cheri_cap_pair_immediate(
+    struct jit_state* state, bool load, enum Registers ct, enum Registers ct2, enum Registers cn, uint32_t offset)
+{
+    assert(offset % 16 == 0);
+    uint32_t imm7 = offset / 16;
+    assert(imm7 < 0x80);
+    uint32_t base = load ? 0x42c00000U : 0x42800000U;
+    emit_instruction(state, base | (imm7 << 15) | (ct2 << 10) | (cn << 5) | ct);
+}
+
+static void
+emit_cheri_scbnds_immediate(struct jit_state* state, enum Registers cd, enum Registers cn, uint32_t length)
+{
+    uint32_t imm;
+    uint32_t shift = 0;
+    if (length <= 63) {
+        imm = length;
+    } else {
+        assert(length % 16 == 0);
+        imm = length / 16;
+        shift = 1U << 14;
+    }
+    assert(imm <= 63);
+    emit_instruction(state, 0xc2c03800U | (imm << 15) | shift | (cn << 5) | cd);
+}
+
+static void
+emit_cheri_scbnds_register(struct jit_state* state, enum Registers cd, enum Registers cn, enum Registers xm)
+{
+    emit_instruction(state, 0xc2c00000U | (xm << 16) | (cn << 5) | cd);
 }
 
 static void
@@ -291,12 +336,22 @@ emit_cheri_ret_c30(struct jit_state* state)
 }
 
 static void
+emit_cheri_mov_cap(struct jit_state* state, enum Registers cd, enum Registers cn)
+{
+    /* Morello MOV Cd, Cn. Encoding verified from assembler output:
+     *   mov c0, c1 -> 0xc2c1d020
+     *   mov c6, c1 -> 0xc2c1d026
+     *   mov c0, c6 -> 0xc2c1d0c0
+     */
+    emit_instruction(state, 0xc2c1d000U | (cn << 5) | cd);
+}
+
+static void
 emit_cheri_add_csp_from(struct jit_state* state, enum Registers rn, uint32_t imm12)
 {
     /* Morello ADD CSP, C<rn>, #imm12 — restores CSP from another capability
      * register. Same instruction family as add csp, csp. */
-    uint32_t base = 0x02000000U;
-    emit_instruction(state, base | (imm12 << 10) | (rn << 5) | SP);
+    emit_cheri_addsub_cap_immediate(state, AS_ADD, SP, rn, imm12);
 }
 
 enum LoadStoreOpcode
@@ -336,6 +391,19 @@ emit_loadstore_immediate(
     assert(imm9 >= -256 && imm9 < 256);
     imm9 &= 0x1ff;
     emit_instruction(state, imm_op_base | op | (imm9 << 12) | (rn << 5) | rt);
+}
+
+/* [ArmARM-A H.a]: C4.1.66: Load/store register (unsigned immediate).
+ * In Morello purecap mode, the same scalar load encodings use Cn as the
+ * address-authorizing capability base.
+ */
+static void
+emit_loadstore_unsigned_immediate(
+    struct jit_state* state, enum LoadStoreOpcode op, enum Registers rt, enum Registers rn, uint16_t imm12)
+{
+    const uint32_t imm_op_base = 0x39000000U;
+    assert(imm12 < 0x1000);
+    emit_instruction(state, imm_op_base | op | (imm12 << 10) | (rn << 5) | rt);
 }
 
 /* Load-Exclusive/Store-Exclusive for atomics */
@@ -651,51 +719,37 @@ emit_movewide_immediate_blinded(struct jit_state* state, bool sixty_four, enum R
 /* Generate the function prologue.
  *
  * We set the stack to look like:
- *   ubpf_stack_size bytes of UBPF stack
- *   SP on entry
- *   SP on entry
- *   Callee saved registers
- *   Frame <- SP.
+ *   C29/C30 capability save area
+ *   bounded ubpf_stack_size bytes of eBPF stack
+ *   original CSP on entry
  * Precondition: The runtime stack pointer is 16-byte aligned.
  * Postcondition:  The runtime stack pointer is 16-byte aligned.
  */
 static void
 emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 {
-    /*
-     * CHERI M3 prologue: decoupled stack mapping.
-     *
-     * The eBPF stack is allocated on a SEPARATE mmap'd page with
-     * PROT_READ|PROT_WRITE (no PROT_EXEC). This avoids the W^X
-     * SIGPROT crash that occurs when stores are executed from
-     * mmap'd PROT_EXEC memory on QEMU Morello.
-     *
-     * The stack base address (top of stack, since eBPF grows downward)
-     * is embedded in the JIT literal pool and loaded into R10 via
-     * a PC-relative literal load (ldr).  A64 loads from the code page
-     * go through PCC which has PERMIT_LOAD, so the literal load works.
-     *
-     * eBPF stack load/store instructions use the R10-mapped register
-     * (R23) as the base. A64 ldr/str through X23 go through DDC,
-     * not CSP — bypassing the CSP-specific crash.
-     *
-     * The JIT caller (ubpf_compile_ex) patches the literal pool entry
-     * with the actual stack address after mmap'ing the stack page.
-     */
-    state->stack_size = 0;
+    const uint32_t frame_save_size = 32;
+    state->stack_size = frame_save_size + ubpf_stack_size;
 
     if (state->jit_mode == BasicJitMode) {
-        /* Load eBPF stack top (R10) from literal pool. */
-        DECLARE_PATCHABLE_SPECIAL_TARGET(stack_base_tgt, StackBase);
-        emit_loadstore_literal(state, LS_LDRL, map_register(10), stack_base_tgt);
+        /* Allocate one frame containing C29/C30 save space and the eBPF stack. */
+        emit_cheri_addsub_csp_immediate(state, AS_SUB, state->stack_size);
+        emit_cheri_cap_pair_immediate(state, false, R29, R30, SP, 0);
+        emit_cheri_mov_cap(state, R29, SP);
+
+        /* r10 is the eBPF frame pointer: a capability to one-past the stack. */
+        emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), SP, frame_save_size);
+        emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
+        emit_cheri_scbnds_register(state, map_register(10), map_register(10), temp_register);
+        emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), map_register(10), ubpf_stack_size);
     } else {
         /* Extended mode: stack passed via R2/R3 as before. */
         emit_addsub_immediate(state, true, AS_ADD, map_register(10), R2, 0);
         emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), R3);
     }
 
-    /* Copy R0 to the volatile context for safe keeping. */
-    emit_logical_register(state, true, LOG_ORR, VOLATILE_CTXT, RZ, R0);
+    /* Copy C0 to the volatile context for safe keeping without stripping the tag. */
+    emit_cheri_mov_cap(state, VOLATILE_CTXT, R0);
 
     DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
     DECLARE_PATCHABLE_SPECIAL_TARGET(enter_tgt, Enter);
@@ -714,8 +768,9 @@ emit_jit_epilogue(struct jit_state* state)
         emit_logical_register(state, true, LOG_ORR, R0, RZ, map_register(0));
     }
 
-    /* CHERI M3: no stack deallocation needed — the eBPF stack lives on
-     * a separate page managed by ubpf_compile_ex, not on CSP. */
+    emit_cheri_cap_pair_immediate(state, true, R29, R30, SP, 0);
+    emit_cheri_addsub_csp_immediate(state, AS_ADD, state->stack_size);
+
     /* CHeri: Morello ret c30 — capability-aware return */
     emit_cheri_ret_c30(state);
 }
@@ -1252,6 +1307,65 @@ to_loadstore_opcode(int opcode)
     }
 }
 
+static bool
+is_load_opcode(uint8_t opcode)
+{
+    switch (opcode) {
+    case EBPF_OP_LDXW:
+    case EBPF_OP_LDXH:
+    case EBPF_OP_LDXB:
+    case EBPF_OP_LDXDW:
+    case EBPF_OP_LDXWSX:
+    case EBPF_OP_LDXHSX:
+    case EBPF_OP_LDXBSX:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t
+load_size(uint8_t opcode)
+{
+    switch (opcode) {
+    case EBPF_OP_LDXB:
+    case EBPF_OP_LDXBSX:
+        return 1;
+    case EBPF_OP_LDXH:
+    case EBPF_OP_LDXHSX:
+        return 2;
+    case EBPF_OP_LDXW:
+    case EBPF_OP_LDXWSX:
+        return 4;
+    case EBPF_OP_LDXDW:
+        return 8;
+    default:
+        assert(false);
+        return 0;
+    }
+}
+
+static bool
+emit_context_cap_load(
+    struct jit_state* state, uint8_t opcode, enum Registers dst, enum Registers src, int16_t offset)
+{
+    uint32_t size = load_size(opcode);
+    if (offset >= -256 && offset < 256) {
+        emit_loadstore_immediate(state, to_loadstore_opcode(opcode), dst, src, offset);
+        return true;
+    }
+
+    if (offset >= 0 && ((uint32_t)offset % size) == 0) {
+        uint32_t scaled_offset = (uint32_t)offset / size;
+        if (scaled_offset < 0x1000) {
+            emit_loadstore_unsigned_immediate(state, to_loadstore_opcode(opcode), dst, src, (uint16_t)scaled_offset);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static enum Condition
 to_condition(int opcode)
 {
@@ -1298,6 +1412,9 @@ static int
 translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
 {
     int i;
+    enum CheriRegKind reg_kind[REGISTER_MAP_SIZE] = {0};
+    reg_kind[1] = CHERI_REG_CONTEXT_CAP;
+    reg_kind[10] = CHERI_REG_STACK_CAP;
 
     emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
 
@@ -1332,11 +1449,8 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         if (i == 0 || vm->int_funcs[i]) {
             size_t prolog_start = state->offset;
             emit_movewide_immediate(state, true, temp_register, ubpf_stack_usage_for_local_func(vm, i));
-            /* CHERI: skip stack store — stores from mmap'd PROT_EXEC memory
-             * crash on QEMU Morello. The stack usage value is only needed for
-             * local function calls, which are not yet supported in the CHERI
-             * backend. The sub csp is kept for stack frame setup. */
-            emit_cheri_addsub_csp_immediate(state, AS_SUB, 16);
+            /* Local calls are rejected below; keep only a fixed-size marker so
+             * branch patching remains consistent with the stock backend shape. */
             // Record the size of the prolog so that we can calculate offset when doing a local call.
             if (state->bpf_function_prolog_size == 0) {
                 state->bpf_function_prolog_size = state->offset - prolog_start;
@@ -1355,6 +1469,8 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         enum Registers dst = map_register(inst.dst);
         enum Registers src = map_register(inst.src);
         uint8_t opcode = inst.opcode;
+        enum CheriRegKind dst_kind_after = reg_kind[inst.dst];
+        bool update_dst_kind = false;
 
         // Use int64_t to avoid signed overflow with large immediates
         int64_t target_pc_64;
@@ -1452,8 +1568,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                 // Sign-extend 32-bit to 64-bit: SXTW
                 // SBFM Xd, Wn, #0, #31 (opcode: 0x93407C00)
                 emit_instruction(state, 0x93407C00U | (src << 5) | dst);
+            } else if (reg_kind[inst.src] != CHERI_REG_SCALAR) {
+                emit_cheri_mov_cap(state, dst, src);
             } else {
-                // Normal mov (offset == 0): ORR dst, RZ, src
+                // Normal scalar mov (offset == 0): ORR dst, RZ, src
                 emit_logical_register(state, sixty_four, LOG_ORR, dst, RZ, src);
             }
             break;
@@ -1560,29 +1678,25 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                     emit_conditionalbranch_immediate(state, COND_EQ, exit_tgt);
                 }
             } else if (inst.src == 1) {
-                uint32_t call_target = i + inst.imm + 1;
-                emit_local_call(state, call_target);
+                *errmsg = ubpf_error("CHERI JIT does not support local function calls at PC %d", i);
+                state->jit_status = UnexpectedInstruction;
             } else {
                 emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
             }
             break;
         }
         case EBPF_OP_EXIT: {
+            if (reg_kind[0] != CHERI_REG_SCALAR) {
+                *errmsg = ubpf_error("CHERI JIT does not allow returning a capability value at PC %d", i);
+                state->jit_status = UnexpectedInstruction;
+                break;
+            }
             /* CHERI: branch to epilogue (which deallocates stack and does ret c30). */
             DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
             emit_unconditionalbranch_immediate(state, UBR_B, exit_tgt);
             break;
         }
 
-        case EBPF_OP_STXW:
-        case EBPF_OP_STXH:
-        case EBPF_OP_STXB:
-        case EBPF_OP_STXDW: {
-            enum Registers tmp = dst;
-            dst = src;
-            src = tmp;
-        }
-            /* fallthrough: */
         case EBPF_OP_LDXW:
         case EBPF_OP_LDXH:
         case EBPF_OP_LDXB:
@@ -1590,102 +1704,39 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_LDXWSX:
         case EBPF_OP_LDXHSX:
         case EBPF_OP_LDXBSX:
-            if (inst.offset >= -256 && inst.offset < 256) {
-                emit_loadstore_immediate(state, to_loadstore_opcode(opcode), dst, src, inst.offset);
-            } else {
-                // Compute address into a temporary register so negative large offsets work correctly.
-                // (A64 load/store register-offset form is unsuitable for negative offsets.)
-                enum Registers addr_temp = temp_div_register;
-                int32_t abs_offset = inst.offset;
-                enum AddSubOpcode op = AS_ADD;
-
-                if (inst.offset < 0) {
-                    op = AS_SUB;
-                    abs_offset = -(int32_t)inst.offset;
-                }
-
-                if (abs_offset < 0x1000) {
-                    emit_addsub_immediate(state, true, op, addr_temp, src, (uint32_t)abs_offset);
-                } else {
-                    EMIT_MOVEWIDE_IMMEDIATE(vm, state, true, offset_register, (uint32_t)abs_offset);
-                    emit_addsub_register(state, true, op, addr_temp, src, offset_register);
-                }
-
-                emit_loadstore_immediate(state, to_loadstore_opcode(opcode), dst, addr_temp, 0);
+            if (reg_kind[inst.src] != CHERI_REG_CONTEXT_CAP) {
+                *errmsg = ubpf_error(
+                    "CHERI JIT only supports loads from the R1 context capability at PC %d: opcode %02x", i, opcode);
+                state->jit_status = UnexpectedInstruction;
+                break;
             }
+            if (!emit_context_cap_load(state, opcode, dst, src, inst.offset)) {
+                *errmsg = ubpf_error(
+                    "CHERI JIT cannot encode context load offset at PC %d: opcode %02x offset %d",
+                    i,
+                    opcode,
+                    inst.offset);
+                state->jit_status = UnexpectedInstruction;
+                break;
+            }
+            update_dst_kind = true;
+            dst_kind_after = CHERI_REG_SCALAR;
             break;
 
-        case EBPF_OP_ATOMIC_STORE: {
-            bool fetch = inst.imm & EBPF_ATOMIC_OP_FETCH;
-            // Use R24 as temp for loaded value, offset_register (R26) for address calc
-            // Use temp_div_register (R25) as status register for STXR (not mapped to any BPF register)
-            enum Registers result_reg = src; // Where to store the fetched value
-            enum Registers temp_reg = temp_register; // Temp for operation result
-            enum Registers status_reg = temp_div_register; // Status register for STXR (R25)
-            
-            switch (inst.imm & EBPF_ALU_OP_MASK) {
-            case EBPF_ALU_OP_ADD:
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_ADD, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_OR:
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_OR, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_AND:
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_AND, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_XOR:
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_XOR, false, false, fetch);
-                break;
-            case (EBPF_ATOMIC_OP_XCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, 0, false, true, true);
-                break;
-            case (EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH):
-                // For CMPXCHG, result goes to R0 (BPF register 0)
-                result_reg = map_register(0);
-                emit_atomic_operation(state, vm, true, src, dst, result_reg, temp_reg, status_reg, inst.offset, 0, true, false, true);
-                break;
-            default:
-                *errmsg = ubpf_error("Unknown atomic operation at PC %d: imm %02x", i, inst.imm);
-                state->jit_status = UnknownInstruction;
-                break;
-            }
-        } break;
-
-        case EBPF_OP_ATOMIC32_STORE: {
-            bool fetch = inst.imm & EBPF_ATOMIC_OP_FETCH;
-            // Use R24 as temp for loaded value, offset_register (R26) for address calc
-            // Use temp_div_register (R25) as status register for STXR (not mapped to any BPF register)
-            enum Registers result_reg = src; // Where to store the fetched value
-            enum Registers temp_reg = temp_register; // Temp for operation result
-            enum Registers status_reg = temp_div_register; // Status register for STXR (R25)
-            
-            switch (inst.imm & EBPF_ALU_OP_MASK) {
-            case EBPF_ALU_OP_ADD:
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_ADD, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_OR:
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_OR, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_AND:
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_AND, false, false, fetch);
-                break;
-            case EBPF_ALU_OP_XOR:
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, EBPF_ALU_OP_XOR, false, false, fetch);
-                break;
-            case (EBPF_ATOMIC_OP_XCHG & ~EBPF_ATOMIC_OP_FETCH):
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, 0, false, true, true);
-                break;
-            case (EBPF_ATOMIC_OP_CMPXCHG & ~EBPF_ATOMIC_OP_FETCH):
-                // For CMPXCHG, result goes to R0 (BPF register 0)
-                result_reg = map_register(0);
-                emit_atomic_operation(state, vm, false, src, dst, result_reg, temp_reg, status_reg, inst.offset, 0, true, false, true);
-                break;
-            default:
-                *errmsg = ubpf_error("Unknown atomic operation at PC %d: imm %02x", i, inst.imm);
-                state->jit_status = UnknownInstruction;
-                break;
-            }
-        } break;
+        case EBPF_OP_STW:
+        case EBPF_OP_STH:
+        case EBPF_OP_STB:
+        case EBPF_OP_STDW:
+        case EBPF_OP_STXW:
+        case EBPF_OP_STXH:
+        case EBPF_OP_STXB:
+        case EBPF_OP_STXDW:
+        case EBPF_OP_ATOMIC_STORE:
+        case EBPF_OP_ATOMIC32_STORE:
+            *errmsg = ubpf_error(
+                "CHERI JIT does not yet support memory opcode at PC %d: opcode %02x", i, opcode);
+            state->jit_status = UnexpectedInstruction;
+            break;
 
         case EBPF_OP_LDDW: {
             struct ebpf_inst inst2 = ubpf_fetch_instruction(vm, ++i);
@@ -1700,10 +1751,6 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_MOD_IMM:
         case EBPF_OP_DIV64_IMM:
         case EBPF_OP_MOD64_IMM:
-        case EBPF_OP_STW:
-        case EBPF_OP_STH:
-        case EBPF_OP_STB:
-        case EBPF_OP_STDW:
         case EBPF_OP_JSET_IMM:
         case EBPF_OP_JSET32_IMM:
         case EBPF_OP_OR_IMM:
@@ -1720,9 +1767,78 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_ARSH64_IMM:
             *errmsg = ubpf_error("Unexpected instruction at PC %d: opcode %02x, immediate %08x", i, opcode, inst.imm);
             state->jit_status = UnexpectedInstruction;
+            break;
         default:
             *errmsg = ubpf_error("Unknown instruction at PC %d: opcode %02x", i, opcode);
             state->jit_status = UnknownInstruction;
+        }
+
+        if (state->jit_status == NoError) {
+            switch (opcode) {
+            case EBPF_OP_MOV_REG:
+            case EBPF_OP_MOV64_REG:
+                update_dst_kind = true;
+                dst_kind_after = reg_kind[inst.src];
+                break;
+            case EBPF_OP_JA:
+            case EBPF_OP_JA32:
+            case EBPF_OP_JEQ_IMM:
+            case EBPF_OP_JGT_IMM:
+            case EBPF_OP_JGE_IMM:
+            case EBPF_OP_JLT_IMM:
+            case EBPF_OP_JLE_IMM:
+            case EBPF_OP_JNE_IMM:
+            case EBPF_OP_JSGT_IMM:
+            case EBPF_OP_JSGE_IMM:
+            case EBPF_OP_JSLT_IMM:
+            case EBPF_OP_JSLE_IMM:
+            case EBPF_OP_JEQ32_IMM:
+            case EBPF_OP_JGT32_IMM:
+            case EBPF_OP_JGE32_IMM:
+            case EBPF_OP_JLT32_IMM:
+            case EBPF_OP_JLE32_IMM:
+            case EBPF_OP_JNE32_IMM:
+            case EBPF_OP_JSGT32_IMM:
+            case EBPF_OP_JSGE32_IMM:
+            case EBPF_OP_JSLT32_IMM:
+            case EBPF_OP_JSLE32_IMM:
+            case EBPF_OP_JEQ_REG:
+            case EBPF_OP_JGT_REG:
+            case EBPF_OP_JGE_REG:
+            case EBPF_OP_JLT_REG:
+            case EBPF_OP_JLE_REG:
+            case EBPF_OP_JNE_REG:
+            case EBPF_OP_JSGT_REG:
+            case EBPF_OP_JSGE_REG:
+            case EBPF_OP_JSLT_REG:
+            case EBPF_OP_JSLE_REG:
+            case EBPF_OP_JEQ32_REG:
+            case EBPF_OP_JGT32_REG:
+            case EBPF_OP_JGE32_REG:
+            case EBPF_OP_JLT32_REG:
+            case EBPF_OP_JLE32_REG:
+            case EBPF_OP_JNE32_REG:
+            case EBPF_OP_JSGT32_REG:
+            case EBPF_OP_JSGE32_REG:
+            case EBPF_OP_JSLT32_REG:
+            case EBPF_OP_JSLE32_REG:
+            case EBPF_OP_JSET_REG:
+            case EBPF_OP_JSET32_REG:
+            case EBPF_OP_EXIT:
+                break;
+            case EBPF_OP_CALL:
+                reg_kind[0] = CHERI_REG_SCALAR;
+                break;
+            default:
+                if (!is_load_opcode(opcode)) {
+                    update_dst_kind = true;
+                    dst_kind_after = CHERI_REG_SCALAR;
+                }
+                break;
+            }
+            if (update_dst_kind) {
+                reg_kind[inst.dst] = dst_kind_after;
+            }
         }
     }
 

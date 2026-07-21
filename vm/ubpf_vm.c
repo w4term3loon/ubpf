@@ -32,6 +32,9 @@
 #include <sys/mman.h>
 #include <endian.h>
 #include <unistd.h>
+#if defined(__CHERI_PURE_CAPABILITY__)
+#include <dlfcn.h>
+#endif
 
 #define SHIFT_MASK_32_BIT(X) ((X) & 0x1f)
 #define SHIFT_MASK_64_BIT(X) ((X) & 0x3f)
@@ -199,7 +202,19 @@ ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_f
     int success = 0;
 
     if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
-        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_WRITE) < 0) {
+#if defined(__CHERI_PURE_CAPABILITY__)
+        if (vm->cheri_objjit_handle) {
+            return -1;
+        }
+        void* jitted_mapping = vm->jitted_mapping;
+        int writable_prot = PROT_READ | PROT_WRITE | PROT_CAP;
+        int executable_prot = PROT_READ | PROT_EXEC | PROT_CAP;
+#else
+        void* jitted_mapping = vm->jitted;
+        int writable_prot = PROT_READ | PROT_WRITE;
+        int executable_prot = PROT_READ | PROT_EXEC;
+#endif
+        if (mprotect(jitted_mapping, vm->jitted_size, writable_prot) < 0) {
             return -1;
         }
 
@@ -208,14 +223,14 @@ ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_f
                 vm,
                 (extended_external_helper_t)fn,
                 idx,
-                (uint8_t*)vm->jitted,
+                (uint8_t*)jitted_mapping,
                 vm->jitted_size,
                 vm->jitted_result.external_helper_offset)) {
             // Can't immediately stop here because we have unprotected memory!
             success = -1;
         }
 
-        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_EXEC) < 0) {
+        if (mprotect(jitted_mapping, vm->jitted_size, executable_prot) < 0) {
             return -1;
         }
     }
@@ -232,18 +247,30 @@ ubpf_register_external_dispatcher(
     int success = 0;
 
     if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
-        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_WRITE) < 0) {
+#if defined(__CHERI_PURE_CAPABILITY__)
+        if (vm->cheri_objjit_handle) {
+            return -1;
+        }
+        void* jitted_mapping = vm->jitted_mapping;
+        int writable_prot = PROT_READ | PROT_WRITE | PROT_CAP;
+        int executable_prot = PROT_READ | PROT_EXEC | PROT_CAP;
+#else
+        void* jitted_mapping = vm->jitted;
+        int writable_prot = PROT_READ | PROT_WRITE;
+        int executable_prot = PROT_READ | PROT_EXEC;
+#endif
+        if (mprotect(jitted_mapping, vm->jitted_size, writable_prot) < 0) {
             return -1;
         }
 
         // Now, update!
         if (!vm->jit_update_dispatcher(
-                vm, dispatcher, (uint8_t*)vm->jitted, vm->jitted_size, vm->jitted_result.external_dispatcher_offset)) {
+                vm, dispatcher, (uint8_t*)jitted_mapping, vm->jitted_size, vm->jitted_result.external_dispatcher_offset)) {
             // Can't immediately stop here because we have unprotected memory!
             success = -1;
         }
 
-        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_EXEC) < 0) {
+        if (mprotect(jitted_mapping, vm->jitted_size, executable_prot) < 0) {
             return -1;
         }
     }
@@ -399,8 +426,22 @@ ubpf_unload_code(struct ubpf_vm* vm)
     free(vm->local_func_stack_usage);
     vm->local_func_stack_usage = calloc(UBPF_MAX_INSTS, sizeof(struct ubpf_stack_usage));
 
+#if defined(__CHERI_PURE_CAPABILITY__)
+    if (vm->cheri_objjit_handle) {
+        dlclose(vm->cheri_objjit_handle);
+        vm->cheri_objjit_handle = NULL;
+        vm->jitted = NULL;
+        vm->jitted_mapping = NULL;
+        vm->jitted_size = 0;
+    } else
+#endif
     if (vm->jitted) {
+#if defined(__CHERI_PURE_CAPABILITY__)
+        munmap(vm->jitted_mapping, vm->jitted_size);
+        vm->jitted_mapping = NULL;
+#else
         munmap(vm->jitted, vm->jitted_size);
+#endif
         vm->jitted = NULL;
         vm->jitted_size = 0;
     }

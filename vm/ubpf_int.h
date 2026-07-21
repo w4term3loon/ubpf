@@ -75,6 +75,10 @@ struct ubpf_vm
     bool readonly_bytecode_enabled;     // Whether bytecode is stored in read-only memory
     ubpf_jit_ex_fn jitted;
     size_t jitted_size;
+#if defined(__CHERI_PURE_CAPABILITY__)
+    void* jitted_mapping;
+    void* cheri_objjit_handle;
+#endif
     size_t jitter_buffer_size;
     struct ubpf_jit_result jitted_result;
     /* CHERI M3: separately mmap'd eBPF stack page (PROT_READ|PROT_WRITE
