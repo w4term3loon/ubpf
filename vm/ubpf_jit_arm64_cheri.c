@@ -53,6 +53,7 @@
 #include <stdint.h>
 #define _GNU_SOURCE
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -147,6 +148,261 @@ enum CheriRegKind
     CHERI_REG_CONTEXT_CAP,
     CHERI_REG_STACK_CAP,
 };
+
+struct CheriRegState
+{
+    bool reachable;
+    enum CheriRegKind regs[REGISTER_MAP_SIZE];
+};
+
+static bool
+is_load_opcode(uint8_t opcode);
+
+static bool
+is_unconditional_jump_opcode(uint8_t opcode)
+{
+    return opcode == EBPF_OP_JA || opcode == EBPF_OP_JA32;
+}
+
+static bool
+is_conditional_jump_opcode(uint8_t opcode)
+{
+    switch (opcode) {
+    case EBPF_OP_JEQ_IMM:
+    case EBPF_OP_JGT_IMM:
+    case EBPF_OP_JGE_IMM:
+    case EBPF_OP_JLT_IMM:
+    case EBPF_OP_JLE_IMM:
+    case EBPF_OP_JNE_IMM:
+    case EBPF_OP_JSGT_IMM:
+    case EBPF_OP_JSGE_IMM:
+    case EBPF_OP_JSLT_IMM:
+    case EBPF_OP_JSLE_IMM:
+    case EBPF_OP_JEQ32_IMM:
+    case EBPF_OP_JGT32_IMM:
+    case EBPF_OP_JGE32_IMM:
+    case EBPF_OP_JLT32_IMM:
+    case EBPF_OP_JLE32_IMM:
+    case EBPF_OP_JNE32_IMM:
+    case EBPF_OP_JSGT32_IMM:
+    case EBPF_OP_JSGE32_IMM:
+    case EBPF_OP_JSLT32_IMM:
+    case EBPF_OP_JSLE32_IMM:
+    case EBPF_OP_JEQ_REG:
+    case EBPF_OP_JGT_REG:
+    case EBPF_OP_JGE_REG:
+    case EBPF_OP_JLT_REG:
+    case EBPF_OP_JLE_REG:
+    case EBPF_OP_JNE_REG:
+    case EBPF_OP_JSGT_REG:
+    case EBPF_OP_JSGE_REG:
+    case EBPF_OP_JSLT_REG:
+    case EBPF_OP_JSLE_REG:
+    case EBPF_OP_JEQ32_REG:
+    case EBPF_OP_JGT32_REG:
+    case EBPF_OP_JGE32_REG:
+    case EBPF_OP_JLT32_REG:
+    case EBPF_OP_JLE32_REG:
+    case EBPF_OP_JNE32_REG:
+    case EBPF_OP_JSGT32_REG:
+    case EBPF_OP_JSGE32_REG:
+    case EBPF_OP_JSLT32_REG:
+    case EBPF_OP_JSLE32_REG:
+    case EBPF_OP_JSET_REG:
+    case EBPF_OP_JSET32_REG:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static enum CheriRegKind
+merge_reg_kind(enum CheriRegKind a, enum CheriRegKind b)
+{
+    return a == b ? a : CHERI_REG_SCALAR;
+}
+
+static bool
+merge_reg_state(struct CheriRegState* dst, const struct CheriRegState* src)
+{
+    if (!src->reachable) {
+        return false;
+    }
+    if (!dst->reachable) {
+        *dst = *src;
+        return true;
+    }
+
+    bool changed = false;
+    for (int i = 0; i < REGISTER_MAP_SIZE; i++) {
+        enum CheriRegKind merged = merge_reg_kind(dst->regs[i], src->regs[i]);
+        if (dst->regs[i] != merged) {
+            dst->regs[i] = merged;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static uint32_t
+branch_target_pc(int pc, struct ebpf_inst inst)
+{
+    int64_t target_pc_64;
+    if (inst.opcode == EBPF_OP_JA32) {
+        target_pc_64 = (int64_t)pc + (int64_t)inst.imm + 1;
+    } else {
+        target_pc_64 = (int64_t)pc + (int64_t)inst.offset + 1;
+    }
+    return (uint32_t)target_pc_64;
+}
+
+static void
+transfer_reg_state(struct ebpf_inst inst, const struct CheriRegState* in, struct CheriRegState* out)
+{
+    *out = *in;
+    uint8_t opcode = inst.opcode;
+
+    switch (opcode) {
+    case EBPF_OP_MOV_REG:
+    case EBPF_OP_MOV64_REG:
+        out->regs[inst.dst] = in->regs[inst.src];
+        break;
+
+    case EBPF_OP_ADD_IMM:
+    case EBPF_OP_ADD64_IMM:
+    case EBPF_OP_SUB_IMM:
+    case EBPF_OP_SUB64_IMM:
+        if (in->regs[inst.dst] == CHERI_REG_SCALAR || (opcode != EBPF_OP_ADD64_IMM && opcode != EBPF_OP_SUB64_IMM)) {
+            out->regs[inst.dst] = CHERI_REG_SCALAR;
+        }
+        break;
+
+    case EBPF_OP_LDXW:
+    case EBPF_OP_LDXH:
+    case EBPF_OP_LDXB:
+    case EBPF_OP_LDXDW:
+    case EBPF_OP_LDXWSX:
+    case EBPF_OP_LDXHSX:
+    case EBPF_OP_LDXBSX:
+        out->regs[inst.dst] = CHERI_REG_SCALAR;
+        break;
+
+    case EBPF_OP_CALL:
+        out->regs[0] = CHERI_REG_SCALAR;
+        break;
+
+    case EBPF_OP_JA:
+    case EBPF_OP_JA32:
+    case EBPF_OP_JEQ_IMM:
+    case EBPF_OP_JGT_IMM:
+    case EBPF_OP_JGE_IMM:
+    case EBPF_OP_JLT_IMM:
+    case EBPF_OP_JLE_IMM:
+    case EBPF_OP_JNE_IMM:
+    case EBPF_OP_JSGT_IMM:
+    case EBPF_OP_JSGE_IMM:
+    case EBPF_OP_JSLT_IMM:
+    case EBPF_OP_JSLE_IMM:
+    case EBPF_OP_JEQ32_IMM:
+    case EBPF_OP_JGT32_IMM:
+    case EBPF_OP_JGE32_IMM:
+    case EBPF_OP_JLT32_IMM:
+    case EBPF_OP_JLE32_IMM:
+    case EBPF_OP_JNE32_IMM:
+    case EBPF_OP_JSGT32_IMM:
+    case EBPF_OP_JSGE32_IMM:
+    case EBPF_OP_JSLT32_IMM:
+    case EBPF_OP_JSLE32_IMM:
+    case EBPF_OP_JEQ_REG:
+    case EBPF_OP_JGT_REG:
+    case EBPF_OP_JGE_REG:
+    case EBPF_OP_JLT_REG:
+    case EBPF_OP_JLE_REG:
+    case EBPF_OP_JNE_REG:
+    case EBPF_OP_JSGT_REG:
+    case EBPF_OP_JSGE_REG:
+    case EBPF_OP_JSLT_REG:
+    case EBPF_OP_JSLE_REG:
+    case EBPF_OP_JEQ32_REG:
+    case EBPF_OP_JGT32_REG:
+    case EBPF_OP_JGE32_REG:
+    case EBPF_OP_JLT32_REG:
+    case EBPF_OP_JLE32_REG:
+    case EBPF_OP_JNE32_REG:
+    case EBPF_OP_JSGT32_REG:
+    case EBPF_OP_JSGE32_REG:
+    case EBPF_OP_JSLT32_REG:
+    case EBPF_OP_JSLE32_REG:
+    case EBPF_OP_JSET_REG:
+    case EBPF_OP_JSET32_REG:
+    case EBPF_OP_EXIT:
+    case EBPF_OP_STW:
+    case EBPF_OP_STH:
+    case EBPF_OP_STB:
+    case EBPF_OP_STDW:
+    case EBPF_OP_STXW:
+    case EBPF_OP_STXH:
+    case EBPF_OP_STXB:
+    case EBPF_OP_STXDW:
+        break;
+
+    default:
+        if (!is_load_opcode(opcode)) {
+            out->regs[inst.dst] = CHERI_REG_SCALAR;
+        }
+        break;
+    }
+}
+
+static int
+analyze_reg_states(struct ubpf_vm* vm, struct CheriRegState** out_states, char** errmsg)
+{
+    struct CheriRegState* states = calloc((size_t)vm->num_insts, sizeof(*states));
+    if (!states) {
+        *errmsg = ubpf_error("Out of memory while analyzing CHERI register provenance.");
+        return -1;
+    }
+
+    states[0].reachable = true;
+    states[0].regs[1] = CHERI_REG_CONTEXT_CAP;
+    states[0].regs[10] = CHERI_REG_STACK_CAP;
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int pc = 0; pc < vm->num_insts; pc++) {
+            if (!states[pc].reachable) {
+                continue;
+            }
+
+            struct ebpf_inst inst = ubpf_fetch_instruction(vm, pc);
+            struct CheriRegState out;
+            transfer_reg_state(inst, &states[pc], &out);
+
+            if (is_unconditional_jump_opcode(inst.opcode) || is_conditional_jump_opcode(inst.opcode)) {
+                uint32_t target = branch_target_pc(pc, inst);
+                if (target >= (uint32_t)vm->num_insts) {
+                    free(states);
+                    *errmsg = ubpf_error("CHERI register analysis found out-of-range branch target at PC %d", pc);
+                    return -1;
+                }
+                changed |= merge_reg_state(&states[target], &out);
+            }
+
+            if (inst.opcode == EBPF_OP_EXIT || is_unconditional_jump_opcode(inst.opcode)) {
+                continue;
+            }
+
+            int fallthrough_pc = pc + (inst.opcode == EBPF_OP_LDDW ? 2 : 1);
+            if (fallthrough_pc < vm->num_insts) {
+                changed |= merge_reg_state(&states[fallthrough_pc], &out);
+            }
+        }
+    }
+
+    *out_states = states;
+    return 0;
+}
 
 /* Return the Arm64 register for the given eBPF register */
 static enum Registers
@@ -1440,9 +1696,11 @@ static int
 translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
 {
     int i;
-    enum CheriRegKind reg_kind[REGISTER_MAP_SIZE] = {0};
-    reg_kind[1] = CHERI_REG_CONTEXT_CAP;
-    reg_kind[10] = CHERI_REG_STACK_CAP;
+    struct CheriRegState* reg_states = NULL;
+    if (analyze_reg_states(vm, &reg_states, errmsg) < 0) {
+        state->jit_status = UnexpectedInstruction;
+        return -1;
+    }
 
     emit_jit_prologue(state, UBPF_EBPF_STACK_SIZE);
 
@@ -1455,6 +1713,8 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         // All checks for errors during the encoding of _this_ instruction
         // occur at the end of the loop.
         struct ebpf_inst inst = ubpf_fetch_instruction(vm, i);
+        enum CheriRegKind reg_kind[REGISTER_MAP_SIZE];
+        memcpy(reg_kind, reg_states[i].regs, sizeof(reg_kind));
 
         // If
         // a) the previous instruction in the eBPF program could fallthrough
@@ -1961,6 +2221,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             assert(false);
         }
         }
+        free(reg_states);
         return -1;
     }
 
@@ -1981,6 +2242,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
     state->dispatcher_loc = emit_dispatched_external_helper_address(state, (uint64_t)vm->dispatcher);
     state->helper_table_loc = emit_helper_table(state, vm);
 
+    free(reg_states);
     return 0;
 }
 
