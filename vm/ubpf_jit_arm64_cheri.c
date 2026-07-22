@@ -742,6 +742,18 @@ emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
         emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
         emit_cheri_scbnds_register(state, map_register(10), map_register(10), temp_register);
         emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), map_register(10), ubpf_stack_size);
+
+        /* Clear the bounded eBPF stack so verifier-rejected uninitialized
+         * scalar stack reads cannot disclose prior native stack contents.
+         */
+        emit_cheri_addsub_cap_immediate(state, AS_SUB, offset_register, map_register(10), ubpf_stack_size);
+        emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
+        uint32_t zero_stack_loop_loc = state->offset;
+        emit_loadstore_immediate(state, LS_STRX, RZ, offset_register, 0);
+        emit_cheri_addsub_cap_immediate(state, AS_ADD, offset_register, offset_register, 8);
+        emit_addsub_immediate(state, true, AS_SUBS, temp_register, temp_register, 8);
+        DECLARE_PATCHABLE_REGULAR_JIT_TARGET(zero_stack_loop_tgt, zero_stack_loop_loc);
+        emit_conditionalbranch_immediate(state, COND_NE, zero_stack_loop_tgt);
     } else {
         /* Extended mode: stack passed via R2/R3 as before. */
         emit_addsub_immediate(state, true, AS_ADD, map_register(10), R2, 0);
@@ -1325,19 +1337,27 @@ is_load_opcode(uint8_t opcode)
 }
 
 static uint32_t
-load_size(uint8_t opcode)
+memory_access_size(uint8_t opcode)
 {
     switch (opcode) {
     case EBPF_OP_LDXB:
     case EBPF_OP_LDXBSX:
+    case EBPF_OP_STB:
+    case EBPF_OP_STXB:
         return 1;
     case EBPF_OP_LDXH:
     case EBPF_OP_LDXHSX:
+    case EBPF_OP_STH:
+    case EBPF_OP_STXH:
         return 2;
     case EBPF_OP_LDXW:
     case EBPF_OP_LDXWSX:
+    case EBPF_OP_STW:
+    case EBPF_OP_STXW:
         return 4;
     case EBPF_OP_LDXDW:
+    case EBPF_OP_STDW:
+    case EBPF_OP_STXDW:
         return 8;
     default:
         assert(false);
@@ -1346,24 +1366,32 @@ load_size(uint8_t opcode)
 }
 
 static bool
-emit_context_cap_load(
-    struct jit_state* state, uint8_t opcode, enum Registers dst, enum Registers src, int16_t offset)
+emit_cap_memory_access(
+    struct jit_state* state, uint8_t opcode, enum Registers rt, enum Registers rn, int16_t offset)
 {
-    uint32_t size = load_size(opcode);
+    uint32_t size = memory_access_size(opcode);
     if (offset >= -256 && offset < 256) {
-        emit_loadstore_immediate(state, to_loadstore_opcode(opcode), dst, src, offset);
+        emit_loadstore_immediate(state, to_loadstore_opcode(opcode), rt, rn, offset);
         return true;
     }
 
     if (offset >= 0 && ((uint32_t)offset % size) == 0) {
         uint32_t scaled_offset = (uint32_t)offset / size;
         if (scaled_offset < 0x1000) {
-            emit_loadstore_unsigned_immediate(state, to_loadstore_opcode(opcode), dst, src, (uint16_t)scaled_offset);
+            emit_loadstore_unsigned_immediate(state, to_loadstore_opcode(opcode), rt, rn, (uint16_t)scaled_offset);
             return true;
         }
     }
 
-    return false;
+    int32_t abs_offset = offset;
+    enum AddSubOpcode op = AS_ADD;
+    if (offset < 0) {
+        op = AS_SUB;
+        abs_offset = -(int32_t)offset;
+    }
+    emit_cheri_addsub_cap_immediate(state, op, offset_register, rn, (uint32_t)abs_offset);
+    emit_loadstore_immediate(state, to_loadstore_opcode(opcode), rt, offset_register, 0);
+    return true;
 }
 
 static enum Condition
@@ -1492,7 +1520,11 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         // all attacker-controlled immediates are blinded.
         // Exception: MOV_IMM/MOV64_IMM are handled directly in their switch case to avoid
         // an extra ORR instruction when blinding is enabled.
+        bool is_cap_addsub_imm = reg_kind[inst.dst] != CHERI_REG_SCALAR &&
+            (opcode == EBPF_OP_ADD_IMM || opcode == EBPF_OP_ADD64_IMM ||
+             opcode == EBPF_OP_SUB_IMM || opcode == EBPF_OP_SUB64_IMM);
         if (is_imm_op(&inst) &&
+            !is_cap_addsub_imm &&
             opcode != EBPF_OP_MOV_IMM &&
             opcode != EBPF_OP_MOV64_IMM &&
             (!is_simple_imm(&inst) || vm->constant_blinding_enabled)) {
@@ -1506,7 +1538,28 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_ADD64_IMM:
         case EBPF_OP_SUB_IMM:
         case EBPF_OP_SUB64_IMM:
-            emit_addsub_immediate(state, sixty_four, to_addsub_opcode(opcode), dst, dst, inst.imm);
+            if (reg_kind[inst.dst] != CHERI_REG_SCALAR) {
+                if (opcode != EBPF_OP_ADD64_IMM && opcode != EBPF_OP_SUB64_IMM) {
+                    *errmsg = ubpf_error(
+                        "CHERI JIT only supports 64-bit immediate arithmetic on capability registers at PC %d",
+                        i);
+                    state->jit_status = UnexpectedInstruction;
+                    break;
+                }
+
+                int64_t imm = inst.imm;
+                enum AddSubOpcode cap_op =
+                    (opcode == EBPF_OP_ADD64_IMM) ? AS_ADD : AS_SUB;
+                if (imm < 0) {
+                    imm = -imm;
+                    cap_op = (cap_op == AS_ADD) ? AS_SUB : AS_ADD;
+                }
+                emit_cheri_addsub_cap_immediate(state, cap_op, dst, dst, (uint32_t)imm);
+                update_dst_kind = true;
+                dst_kind_after = reg_kind[inst.dst];
+            } else {
+                emit_addsub_immediate(state, sixty_four, to_addsub_opcode(opcode), dst, dst, inst.imm);
+            }
             break;
         case EBPF_OP_ADD_REG:
         case EBPF_OP_ADD64_REG:
@@ -1704,33 +1757,51 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_LDXWSX:
         case EBPF_OP_LDXHSX:
         case EBPF_OP_LDXBSX:
-            if (reg_kind[inst.src] != CHERI_REG_CONTEXT_CAP) {
+            if (reg_kind[inst.src] != CHERI_REG_CONTEXT_CAP && reg_kind[inst.src] != CHERI_REG_STACK_CAP) {
                 *errmsg = ubpf_error(
-                    "CHERI JIT only supports loads from the R1 context capability at PC %d: opcode %02x", i, opcode);
-                state->jit_status = UnexpectedInstruction;
-                break;
-            }
-            if (!emit_context_cap_load(state, opcode, dst, src, inst.offset)) {
-                *errmsg = ubpf_error(
-                    "CHERI JIT cannot encode context load offset at PC %d: opcode %02x offset %d",
+                    "CHERI JIT only supports loads from tracked context or stack capabilities at PC %d: opcode %02x",
                     i,
-                    opcode,
-                    inst.offset);
+                    opcode);
                 state->jit_status = UnexpectedInstruction;
                 break;
             }
+            emit_cap_memory_access(state, opcode, dst, src, inst.offset);
             update_dst_kind = true;
             dst_kind_after = CHERI_REG_SCALAR;
+            break;
+
+        case EBPF_OP_STXW:
+        case EBPF_OP_STXH:
+        case EBPF_OP_STXB:
+        case EBPF_OP_STXDW:
+            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP) {
+                *errmsg = ubpf_error(
+                    "CHERI JIT only supports stores to tracked stack capabilities at PC %d: opcode %02x", i, opcode);
+                state->jit_status = UnexpectedInstruction;
+                break;
+            }
+            if (reg_kind[inst.src] != CHERI_REG_SCALAR) {
+                *errmsg = ubpf_error("CHERI JIT does not allow storing a capability value at PC %d", i);
+                state->jit_status = UnexpectedInstruction;
+                break;
+            }
+            emit_cap_memory_access(state, opcode, src, dst, inst.offset);
             break;
 
         case EBPF_OP_STW:
         case EBPF_OP_STH:
         case EBPF_OP_STB:
         case EBPF_OP_STDW:
-        case EBPF_OP_STXW:
-        case EBPF_OP_STXH:
-        case EBPF_OP_STXB:
-        case EBPF_OP_STXDW:
+            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP) {
+                *errmsg = ubpf_error(
+                    "CHERI JIT only supports stores to tracked stack capabilities at PC %d: opcode %02x", i, opcode);
+                state->jit_status = UnexpectedInstruction;
+                break;
+            }
+            EMIT_MOVEWIDE_IMMEDIATE(vm, state, true, temp_register, (int64_t)inst.imm);
+            emit_cap_memory_access(state, opcode, temp_register, dst, inst.offset);
+            break;
+
         case EBPF_OP_ATOMIC_STORE:
         case EBPF_OP_ATOMIC32_STORE:
             *errmsg = ubpf_error(
@@ -1780,6 +1851,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                 update_dst_kind = true;
                 dst_kind_after = reg_kind[inst.src];
                 break;
+            case EBPF_OP_ADD_IMM:
+            case EBPF_OP_ADD64_IMM:
+            case EBPF_OP_SUB_IMM:
+            case EBPF_OP_SUB64_IMM:
             case EBPF_OP_JA:
             case EBPF_OP_JA32:
             case EBPF_OP_JEQ_IMM:
@@ -1825,6 +1900,14 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             case EBPF_OP_JSET_REG:
             case EBPF_OP_JSET32_REG:
             case EBPF_OP_EXIT:
+            case EBPF_OP_STW:
+            case EBPF_OP_STH:
+            case EBPF_OP_STB:
+            case EBPF_OP_STDW:
+            case EBPF_OP_STXW:
+            case EBPF_OP_STXH:
+            case EBPF_OP_STXB:
+            case EBPF_OP_STXDW:
                 break;
             case EBPF_OP_CALL:
                 reg_kind[0] = CHERI_REG_SCALAR;
