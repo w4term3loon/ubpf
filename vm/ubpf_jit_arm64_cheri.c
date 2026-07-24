@@ -277,6 +277,16 @@ transfer_reg_state(struct ebpf_inst inst, const struct CheriRegState* in, struct
         }
         break;
 
+    case EBPF_OP_ADD_REG:
+    case EBPF_OP_ADD64_REG:
+    case EBPF_OP_SUB_REG:
+    case EBPF_OP_SUB64_REG:
+        if (in->regs[inst.dst] == CHERI_REG_SCALAR || in->regs[inst.src] != CHERI_REG_SCALAR ||
+            (opcode != EBPF_OP_ADD64_REG && opcode != EBPF_OP_SUB64_REG)) {
+            out->regs[inst.dst] = CHERI_REG_SCALAR;
+        }
+        break;
+
     case EBPF_OP_LDXW:
     case EBPF_OP_LDXH:
     case EBPF_OP_LDXB:
@@ -525,6 +535,17 @@ emit_addsub_register(
  *   scbnds cd, cn, #imm   -> 0xc2c03800 | enc(imm) | (cn << 5) | cd
  *   ret c30               -> 0xc2c253c0
  */
+
+static void
+emit_cheri_add_cap_register(
+    struct jit_state* state, enum Registers cd, enum Registers cn, enum Registers xm)
+{
+    /* Morello ADD Cd, Cn, Xm, UXTX. The scalar register is used only as an
+     * offset; capability provenance comes from Cn and is preserved in Cd.
+     * Encoding verified from compiler output: add c0, c0, x1, uxtx -> 0xc2a16000.
+     */
+    emit_instruction(state, 0xc2a06000U | (xm << 16) | (cn << 5) | cd);
+}
 
 static void
 emit_cheri_addsub_cap_immediate(
@@ -1825,7 +1846,27 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_ADD64_REG:
         case EBPF_OP_SUB_REG:
         case EBPF_OP_SUB64_REG:
-            emit_addsub_register(state, sixty_four, to_addsub_opcode(opcode), dst, dst, src);
+            if (reg_kind[inst.dst] != CHERI_REG_SCALAR) {
+                if ((opcode != EBPF_OP_ADD64_REG && opcode != EBPF_OP_SUB64_REG) ||
+                    reg_kind[inst.src] != CHERI_REG_SCALAR) {
+                    *errmsg = ubpf_error(
+                        "CHERI JIT only supports 64-bit scalar register offsets on capability registers at PC %d",
+                        i);
+                    state->jit_status = UnexpectedInstruction;
+                    break;
+                }
+
+                enum Registers offset_src = src;
+                if (opcode == EBPF_OP_SUB64_REG) {
+                    emit_addsub_register(state, true, AS_SUB, temp_register, RZ, src);
+                    offset_src = temp_register;
+                }
+                emit_cheri_add_cap_register(state, dst, dst, offset_src);
+                update_dst_kind = true;
+                dst_kind_after = reg_kind[inst.dst];
+            } else {
+                emit_addsub_register(state, sixty_four, to_addsub_opcode(opcode), dst, dst, src);
+            }
             break;
         case EBPF_OP_LSH_REG:
         case EBPF_OP_RSH_REG:
