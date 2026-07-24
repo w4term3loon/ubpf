@@ -442,7 +442,7 @@ ubpf_load_elf_ex(struct ubpf_vm* vm, const void* elf, size_t elf_size, const cha
             // Support legacy type 2 from older clang versions (pre-17)
             case R_BPF_64_32_LEGACY:
             case R_BPF_64_32: {
-                if (applies_to_inst->src == 1) {
+                if (applies_to_inst->src == 1 && relo_sym.st_shndx != SHN_UNDEF) {
                     // Perform local function call relocation.
                     int target_function_in_section_idx = relo_sym.st_shndx;
 
@@ -463,16 +463,16 @@ ubpf_load_elf_ex(struct ubpf_vm* vm, const void* elf, size_t elf_size, const cha
 
                     applies_to_inst->imm = target_function->landed - (applies_to_inst_index + 1);
                 } else {
-                    // Perform helper function relocation.
-                    // Note: This is a uBPF specific relocation type and is not part of the ELF specification.
-                    // It is used to perform resolution from helper function name to helper function id.
-                    const char* section_name = strtab_data + relo_sym.st_name;
-                    unsigned int imm = ubpf_lookup_registered_function(vm, section_name);
+                    // Perform helper function relocation for undefined symbols.
+                    // Modern clang can emit helper calls with src=1 plus an undefined symbol.
+                    const char* helper_name = strtab_data + relo_sym.st_name;
+                    unsigned int imm = ubpf_lookup_registered_function(vm, helper_name);
                     if (imm == -1) {
-                        *errmsg = ubpf_error("function '%s' not found", section_name);
+                        *errmsg = ubpf_error("function '%s' not found", helper_name);
                         goto error;
                     }
 
+                    applies_to_inst->src = 0;
                     applies_to_inst->imm = imm;
                 }
                 break;

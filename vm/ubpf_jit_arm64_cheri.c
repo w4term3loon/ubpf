@@ -147,6 +147,7 @@ enum CheriRegKind
     CHERI_REG_SCALAR,
     CHERI_REG_CONTEXT_CAP,
     CHERI_REG_STACK_CAP,
+    CHERI_REG_MAP_VALUE_CAP,
 };
 
 struct CheriRegState
@@ -257,7 +258,7 @@ branch_target_pc(int pc, struct ebpf_inst inst)
 }
 
 static void
-transfer_reg_state(struct ebpf_inst inst, const struct CheriRegState* in, struct CheriRegState* out)
+transfer_reg_state(struct ubpf_vm* vm, struct ebpf_inst inst, const struct CheriRegState* in, struct CheriRegState* out)
 {
     *out = *in;
     uint8_t opcode = inst.opcode;
@@ -298,7 +299,9 @@ transfer_reg_state(struct ebpf_inst inst, const struct CheriRegState* in, struct
         break;
 
     case EBPF_OP_CALL:
-        out->regs[0] = CHERI_REG_SCALAR;
+        out->regs[0] = (inst.src == 0 && inst.imm == vm->cheri_map_value_helper_index)
+            ? CHERI_REG_MAP_VALUE_CAP
+            : CHERI_REG_SCALAR;
         break;
 
     case EBPF_OP_JA:
@@ -387,7 +390,7 @@ analyze_reg_states(struct ubpf_vm* vm, struct CheriRegState** out_states, char**
 
             struct ebpf_inst inst = ubpf_fetch_instruction(vm, pc);
             struct CheriRegState out;
-            transfer_reg_state(inst, &states[pc], &out);
+            transfer_reg_state(vm, inst, &states[pc], &out);
 
             if (is_unconditional_jump_opcode(inst.opcode) || is_conditional_jump_opcode(inst.opcode)) {
                 uint32_t target = branch_target_pc(pc, inst);
@@ -2026,7 +2029,17 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_CALL: {
             DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
             if (inst.src == 0) {
-                emit_dispatched_external_helper_call(state, vm, inst.imm);
+                if (inst.imm == vm->cheri_map_value_helper_index) {
+                    /* Experimental map-value helper root: model a trusted helper
+                     * returning a bounded map-value capability. The current
+                     * uBPF helper ABI returns uint64_t, so this deliberately
+                     * avoids pretending arbitrary helpers can return CHERI
+                     * capabilities through that scalar ABI.
+                     */
+                    emit_cheri_mov_cap(state, map_register(0), VOLATILE_CTXT);
+                } else {
+                    emit_dispatched_external_helper_call(state, vm, inst.imm);
+                }
                 if (inst.imm == vm->unwind_stack_extension_index) {
                     emit_addsub_immediate(state, true, AS_SUBS, RZ, map_register(0), 0);
                     emit_conditionalbranch_immediate(state, COND_EQ, exit_tgt);
@@ -2058,9 +2071,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_LDXWSX:
         case EBPF_OP_LDXHSX:
         case EBPF_OP_LDXBSX:
-            if (reg_kind[inst.src] != CHERI_REG_CONTEXT_CAP && reg_kind[inst.src] != CHERI_REG_STACK_CAP) {
+            if (reg_kind[inst.src] != CHERI_REG_CONTEXT_CAP && reg_kind[inst.src] != CHERI_REG_STACK_CAP &&
+                reg_kind[inst.src] != CHERI_REG_MAP_VALUE_CAP) {
                 *errmsg = ubpf_error(
-                    "CHERI JIT only supports loads from tracked context or stack capabilities at PC %d: opcode %02x",
+                    "CHERI JIT only supports loads from tracked context, stack, or map-value capabilities at PC %d: opcode %02x",
                     i,
                     opcode);
                 state->jit_status = UnexpectedInstruction;
@@ -2075,9 +2089,9 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_STXH:
         case EBPF_OP_STXB:
         case EBPF_OP_STXDW:
-            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP) {
+            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP && reg_kind[inst.dst] != CHERI_REG_MAP_VALUE_CAP) {
                 *errmsg = ubpf_error(
-                    "CHERI JIT only supports stores to tracked stack capabilities at PC %d: opcode %02x", i, opcode);
+                    "CHERI JIT only supports stores to tracked stack or map-value capabilities at PC %d: opcode %02x", i, opcode);
                 state->jit_status = UnexpectedInstruction;
                 break;
             }
@@ -2093,9 +2107,9 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_STH:
         case EBPF_OP_STB:
         case EBPF_OP_STDW:
-            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP) {
+            if (reg_kind[inst.dst] != CHERI_REG_STACK_CAP && reg_kind[inst.dst] != CHERI_REG_MAP_VALUE_CAP) {
                 *errmsg = ubpf_error(
-                    "CHERI JIT only supports stores to tracked stack capabilities at PC %d: opcode %02x", i, opcode);
+                    "CHERI JIT only supports stores to tracked stack or map-value capabilities at PC %d: opcode %02x", i, opcode);
                 state->jit_status = UnexpectedInstruction;
                 break;
             }
@@ -2211,7 +2225,9 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             case EBPF_OP_STXDW:
                 break;
             case EBPF_OP_CALL:
-                reg_kind[0] = CHERI_REG_SCALAR;
+                reg_kind[0] = (inst.src == 0 && inst.imm == vm->cheri_map_value_helper_index)
+                    ? CHERI_REG_MAP_VALUE_CAP
+                    : CHERI_REG_SCALAR;
                 break;
             default:
                 if (!is_load_opcode(opcode)) {

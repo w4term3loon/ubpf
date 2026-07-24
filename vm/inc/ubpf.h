@@ -223,6 +223,20 @@ extern "C"
     ubpf_register(struct ubpf_vm* vm, unsigned int index, const char* name, external_function_t fn);
 
     /**
+     * @brief Mark one helper index as returning a CHERI map-value capability.
+     *
+     * This is an experimental CHERI-only hook used by the Morello JIT prototype
+     * to model helper-returned pointer roots such as map values. Other targets
+     * accept the setting but ignore it.
+     *
+     * @param[in] vm The VM to configure.
+     * @param[in] index Helper index that returns a map-value capability, or -1
+     *                  to disable the hook.
+     */
+    void
+    ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index);
+
+    /**
      * @brief The type of an external helper dispatcher function.
      */
     typedef uint64_t (*external_function_dispatcher_t)(

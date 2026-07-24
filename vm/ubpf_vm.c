@@ -161,6 +161,7 @@ ubpf_create(void)
     vm->jit_update_helper = ubpf_jit_update_helper_null;
 #endif
     vm->unwind_stack_extension_index = -1;
+    vm->cheri_map_value_helper_index = -1;
 
     vm->jitted_result.compile_result = UBPF_JIT_COMPILE_FAILURE;
     vm->jitter_buffer_size = DEFAULT_JITTER_BUFFER_SIZE;
@@ -188,6 +189,14 @@ as_external_function_t(void* f)
 {
     return (external_function_t)f;
 };
+
+void
+ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index)
+{
+    if (vm) {
+        vm->cheri_map_value_helper_index = index;
+    }
+}
 
 int
 ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_function_t fn)
