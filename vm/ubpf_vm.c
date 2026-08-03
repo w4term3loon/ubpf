@@ -162,6 +162,8 @@ ubpf_create(void)
 #endif
     vm->unwind_stack_extension_index = -1;
     vm->cheri_map_value_helper_index = -1;
+    vm->cheri_cap_invalidate_helper_index_1 = -1;
+    vm->cheri_cap_invalidate_helper_index_2 = -1;
 
     vm->jitted_result.compile_result = UBPF_JIT_COMPILE_FAILURE;
     vm->jitter_buffer_size = DEFAULT_JITTER_BUFFER_SIZE;
@@ -195,6 +197,15 @@ ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index)
 {
     if (vm) {
         vm->cheri_map_value_helper_index = index;
+    }
+}
+
+void
+ubpf_cheri_set_cap_invalidate_helper_indices(struct ubpf_vm* vm, int first_index, int second_index)
+{
+    if (vm) {
+        vm->cheri_cap_invalidate_helper_index_1 = first_index;
+        vm->cheri_cap_invalidate_helper_index_2 = second_index;
     }
 }
 

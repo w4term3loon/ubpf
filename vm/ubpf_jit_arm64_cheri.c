@@ -105,13 +105,13 @@ enum Registers
     RZ = 31
 };
 
-// The restricted CHERI backend currently keeps BPF state and temporaries in
-// caller-saved registers. If future work uses C ABI callee-saved registers,
-// they must be saved and restored as capabilities.
+// Keep temporaries in caller-saved registers. eBPF callee-saved registers and
+// the saved context capability live in native callee-saved capability registers
+// so ordinary C helpers preserve them across helper calls.
 static enum Registers temp_register = R11;
 static enum Registers temp_div_register = R12;
 static enum Registers offset_register = R13;
-static enum Registers VOLATILE_CTXT = R14;
+static enum Registers VOLATILE_CTXT = R24;
 
 // Number of eBPF registers
 #define REGISTER_MAP_SIZE 11
@@ -120,10 +120,11 @@ static enum Registers VOLATILE_CTXT = R14;
 //   BPF        Arm64       Usage
 //   r0         r5          Return value from calls (see note)
 //   r1 - r5    r0 - r4     Function parameters, caller-saved
-//   r6 - r10   r6 - r10    Caller-saved registers in the restricted CHERI backend
+//   r6 - r10   r19 - r23   eBPF callee-saved registers
 //              r11         Temp - used for generating 32-bit immediates
 //              r12         Temp - used for modulus calculations
 //              r13         Temp - used for large load/store offsets
+//              r24         Saved context capability, preserved across helpers
 //
 // Note that the AArch64 ABI uses r0 both for function parameters and result.  We use r5 to hold
 // the result during the function and do an extra final move at the end of the function to copy the
@@ -135,11 +136,11 @@ static enum Registers register_map[REGISTER_MAP_SIZE] = {
     R2,
     R3,
     R4, // parameters
-    R6,
-    R7,
-    R8,
-    R9,
-    R10,
+    R19,
+    R20,
+    R21,
+    R22,
+    R23,
 };
 
 enum CheriRegKind
@@ -158,6 +159,14 @@ struct CheriRegState
 
 static bool
 is_load_opcode(uint8_t opcode);
+
+static bool
+is_cheri_cap_invalidate_helper(struct ubpf_vm* vm, int helper_index)
+{
+    return helper_index >= 0 &&
+        (helper_index == vm->cheri_cap_invalidate_helper_index_1 ||
+         helper_index == vm->cheri_cap_invalidate_helper_index_2);
+}
 
 static bool
 is_unconditional_jump_opcode(uint8_t opcode)
@@ -1008,13 +1017,18 @@ emit_movewide_immediate_blinded(struct jit_state* state, bool sixty_four, enum R
 static void
 emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 {
-    const uint32_t frame_save_size = 32;
+    const uint32_t frame_save_size = 128;
     state->stack_size = frame_save_size + ubpf_stack_size;
 
     if (state->jit_mode == BasicJitMode) {
-        /* Allocate one frame containing C29/C30 save space and the eBPF stack. */
+        /* Allocate one frame containing native callee-saved capability state and
+         * the bounded eBPF stack.
+         */
         emit_cheri_addsub_csp_immediate(state, AS_SUB, state->stack_size);
         emit_cheri_cap_pair_immediate(state, false, R29, R30, SP, 0);
+        emit_cheri_cap_pair_immediate(state, false, R19, R20, SP, 32);
+        emit_cheri_cap_pair_immediate(state, false, R21, R22, SP, 64);
+        emit_cheri_cap_pair_immediate(state, false, R23, VOLATILE_CTXT, SP, 96);
         emit_cheri_mov_cap(state, R29, SP);
 
         /* r10 is the eBPF frame pointer: a capability to one-past the stack. */
@@ -1060,6 +1074,9 @@ emit_jit_epilogue(struct jit_state* state)
         emit_logical_register(state, true, LOG_ORR, R0, RZ, map_register(0));
     }
 
+    emit_cheri_cap_pair_immediate(state, true, R23, VOLATILE_CTXT, SP, 96);
+    emit_cheri_cap_pair_immediate(state, true, R21, R22, SP, 64);
+    emit_cheri_cap_pair_immediate(state, true, R19, R20, SP, 32);
     emit_cheri_cap_pair_immediate(state, true, R29, R30, SP, 0);
     emit_cheri_addsub_csp_immediate(state, AS_ADD, state->stack_size);
 
@@ -2030,13 +2047,28 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
             if (inst.src == 0) {
                 if (inst.imm == vm->cheri_map_value_helper_index) {
-                    /* Experimental map-value helper root: model a trusted helper
-                     * returning a bounded map-value capability. The current
+                    /* Experimental helper-returned object root: model a trusted
+                     * helper returning a bounded memory capability. The current
                      * uBPF helper ABI returns uint64_t, so this deliberately
                      * avoids pretending arbitrary helpers can return CHERI
                      * capabilities through that scalar ABI.
                      */
                     emit_cheri_mov_cap(state, map_register(0), VOLATILE_CTXT);
+                } else if (is_cheri_cap_invalidate_helper(vm, inst.imm)) {
+                    /* Experimental protocol transition: model helpers such as
+                     * ringbuf_submit/discard as ending authority for currently
+                     * tracked helper-returned object capabilities. We clear the
+                     * hardware registers but intentionally leave provenance
+                     * analysis unchanged, so stale later memory operations trap
+                     * on CHERI tag checks rather than being rejected at compile
+                     * time.
+                     */
+                    for (int reg = 0; reg < REGISTER_MAP_SIZE; reg++) {
+                        if (reg_kind[reg] == CHERI_REG_MAP_VALUE_CAP) {
+                            emit_movewide_immediate(state, true, map_register(reg), 0);
+                        }
+                    }
+                    emit_movewide_immediate(state, true, map_register(0), 0);
                 } else {
                     emit_dispatched_external_helper_call(state, vm, inst.imm);
                 }

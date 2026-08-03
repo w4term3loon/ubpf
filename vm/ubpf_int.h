@@ -116,6 +116,8 @@ struct ubpf_vm
         uint32_t offset);
     int unwind_stack_extension_index;
     int cheri_map_value_helper_index;
+    int cheri_cap_invalidate_helper_index_1;
+    int cheri_cap_invalidate_helper_index_2;
     uint64_t pointer_secret;
     ubpf_data_relocation data_relocation_function;
     void* data_relocation_user_data;

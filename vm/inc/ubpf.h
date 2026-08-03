@@ -237,6 +237,20 @@ extern "C"
     ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index);
 
     /**
+     * @brief Mark up to two helper indices as invalidating CHERI helper-returned capability authority.
+     *
+     * This is an experimental CHERI-only hook used by the Morello JIT prototype
+     * to model helper protocol transitions such as ring-buffer submit/discard.
+     * Other targets accept the setting but ignore it.
+     *
+     * @param[in] vm The VM to configure.
+     * @param[in] first_index First invalidating helper index, or -1 to disable.
+     * @param[in] second_index Second invalidating helper index, or -1 to disable.
+     */
+    void
+    ubpf_cheri_set_cap_invalidate_helper_indices(struct ubpf_vm* vm, int first_index, int second_index);
+
+    /**
      * @brief The type of an external helper dispatcher function.
      */
     typedef uint64_t (*external_function_dispatcher_t)(
