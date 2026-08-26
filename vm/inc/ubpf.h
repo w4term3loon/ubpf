@@ -146,11 +146,6 @@ extern "C"
     bool
     ubpf_toggle_bounds_check(struct ubpf_vm* vm, bool enable);
 
-#if defined(__CHERI_PURE_CAPABILITY__)
-    void
-    ubpf_use_stock_jit(struct ubpf_vm* vm, bool use_stock);
-#endif
-
     /**
      * @brief Enable / disable constant blinding in the JIT compiler.
      * Constant blinding is a security hardening technique that prevents JIT spray attacks by
@@ -223,18 +218,34 @@ extern "C"
     ubpf_register(struct ubpf_vm* vm, unsigned int index, const char* name, external_function_t fn);
 
     /**
-     * @brief Mark one helper index as returning a CHERI map-value capability.
+     * @brief Purecap callback that supplies an object capability to the CHERI JIT.
      *
-     * This is an experimental CHERI-only hook used by the Morello JIT prototype
-     * to model helper-returned pointer roots such as map values. Other targets
-     * accept the setting but ignore it.
+     * The callback is invoked with the execution context and its declared size.
+     * It must return the capability authority that the associated eBPF helper
+     * call is allowed to expose. This is a separate ABI because the standard
+     * uBPF helper ABI returns a scalar uint64_t and cannot carry a tagged
+     * Morello capability.
+     */
+    typedef void* (*ubpf_cheri_capability_provider_t)(void* context, size_t context_size);
+
+    /**
+     * @brief Register one capability-returning helper for the CHERI JIT.
+     *
+     * This experimental API is supported only by the Morello purecap backend.
+     * Registration must happen before JIT compilation. The helper name remains
+     * visible to the ELF loader, while execution uses the capability-preserving
+     * provider ABI above instead of the standard scalar helper ABI.
      *
      * @param[in] vm The VM to configure.
-     * @param[in] index Helper index that returns a map-value capability, or -1
-     *                  to disable the hook.
+     * @param[in] index Helper index associated with the provider.
+     * @param[in] name Human-readable helper name used for ELF relocation.
+     * @param[in] provider Purecap callback that returns object authority.
+     * @retval 0 Success.
+     * @retval -1 Unsupported target or invalid registration.
      */
-    void
-    ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index);
+    int
+    ubpf_cheri_register_capability_provider(
+        struct ubpf_vm* vm, unsigned int index, const char* name, ubpf_cheri_capability_provider_t provider);
 
     /**
      * @brief Mark up to two helper indices as invalidating CHERI helper-returned capability authority.

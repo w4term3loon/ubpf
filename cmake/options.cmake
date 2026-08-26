@@ -13,6 +13,17 @@ if(PLATFORM_LINUX OR PLATFORM_MACOS)
 endif()
 
 option(UBPF_DISABLE_RETPOLINES "Disable retpoline security on indirect calls and jumps")
+set(UBPF_ENABLE_CHERI_JIT_DEFAULT OFF)
+if(PLATFORM_FREEBSD AND CMAKE_SIZEOF_VOID_P EQUAL 16)
+  set(UBPF_ENABLE_CHERI_JIT_DEFAULT ON)
+endif()
+option(UBPF_ENABLE_CHERI_JIT "Build the experimental Morello purecap JIT backend"
+  ${UBPF_ENABLE_CHERI_JIT_DEFAULT})
+unset(UBPF_ENABLE_CHERI_JIT_DEFAULT)
+
+if(PLATFORM_FREEBSD AND CMAKE_SIZEOF_VOID_P EQUAL 16 AND NOT UBPF_ENABLE_CHERI_JIT)
+  message(FATAL_ERROR "Purecap targets require UBPF_ENABLE_CHERI_JIT")
+endif()
 option(UBPF_ENABLE_INSTALL "Set to true to enable the install targets")
 option(UBPF_ENABLE_TESTS "Set to true to enable tests")
 option(UBPF_ENABLE_PACKAGE "Set to true to enable packaging")

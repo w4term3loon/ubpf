@@ -43,7 +43,14 @@ static BOOL CALLBACK init_seed_once(PINIT_ONCE InitOnce, PVOID Parameter, PVOID 
     srand((unsigned int)time(NULL));
     return TRUE;
 }
-#elif defined(__GNUC__) || defined(__clang__)
+#elif defined(__linux__)
+static void init_seed(void) __attribute__((constructor));
+static void init_seed(void)
+{
+    srand((unsigned int)time(NULL));
+}
+#elif !defined(__APPLE__) && !defined(__FreeBSD__)
+#if defined(__GNUC__) || defined(__clang__)
 static void init_seed(void) __attribute__((constructor));
 static void init_seed(void)
 {
@@ -63,6 +70,7 @@ static void ensure_seed_initialized(void)
         seed_initialized = 1;
     }
 }
+#endif
 #endif
 
 int

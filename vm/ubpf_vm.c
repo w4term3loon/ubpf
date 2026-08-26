@@ -32,9 +32,6 @@
 #include <sys/mman.h>
 #include <endian.h>
 #include <unistd.h>
-#if defined(__CHERI_PURE_CAPABILITY__)
-#include <dlfcn.h>
-#endif
 
 #define SHIFT_MASK_32_BIT(X) ((X) & 0x1f)
 #define SHIFT_MASK_64_BIT(X) ((X) & 0x3f)
@@ -61,22 +58,6 @@ ubpf_toggle_bounds_check(struct ubpf_vm* vm, bool enable)
     vm->bounds_check_enabled = enable;
     return old;
 }
-
-#if defined(__CHERI_PURE_CAPABILITY__)
-void
-ubpf_use_stock_jit(struct ubpf_vm* vm, bool use_stock)
-{
-    if (use_stock) {
-        vm->jit_translate = ubpf_translate_arm64;
-        vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64;
-        vm->jit_update_helper = ubpf_jit_update_helper_arm64;
-    } else {
-        vm->jit_translate = ubpf_translate_arm64_cheri;
-        vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64_cheri;
-        vm->jit_update_helper = ubpf_jit_update_helper_arm64_cheri;
-    }
-}
-#endif
 
 bool
 ubpf_toggle_constant_blinding(struct ubpf_vm* vm, bool enable)
@@ -161,7 +142,7 @@ ubpf_create(void)
     vm->jit_update_helper = ubpf_jit_update_helper_null;
 #endif
     vm->unwind_stack_extension_index = -1;
-    vm->cheri_map_value_helper_index = -1;
+    vm->cheri_capability_provider_index = -1;
     vm->cheri_cap_invalidate_helper_index_1 = -1;
     vm->cheri_cap_invalidate_helper_index_2 = -1;
 
@@ -174,11 +155,6 @@ void
 ubpf_destroy(struct ubpf_vm* vm)
 {
     ubpf_unload_code(vm);
-#ifdef __CHERI_PURE_CAPABILITY__
-    if (vm->ebpf_stack_page) {
-        munmap(vm->ebpf_stack_page, UBPF_EBPF_STACK_SIZE);
-    }
-#endif
     free(vm->int_funcs);
     free(vm->ext_funcs);
     free(vm->ext_func_names);
@@ -192,12 +168,28 @@ as_external_function_t(void* f)
     return (external_function_t)f;
 };
 
-void
-ubpf_cheri_set_map_value_helper_index(struct ubpf_vm* vm, int index)
+int
+ubpf_cheri_register_capability_provider(
+    struct ubpf_vm* vm, unsigned int index, const char* name, ubpf_cheri_capability_provider_t provider)
 {
-    if (vm) {
-        vm->cheri_map_value_helper_index = index;
+#if defined(__CHERI_PURE_CAPABILITY__)
+    if (!vm || index >= MAX_EXT_FUNCS || !name || !provider || vm->jitted ||
+        vm->cheri_capability_provider_index != -1) {
+        return -1;
     }
+
+    vm->ext_funcs[index] = (extended_external_helper_t)provider;
+    vm->ext_func_names[index] = name;
+    vm->cheri_capability_provider_index = (int)index;
+    vm->cheri_capability_provider = provider;
+    return 0;
+#else
+    UNUSED_PARAMETER(vm);
+    UNUSED_PARAMETER(index);
+    UNUSED_PARAMETER(name);
+    UNUSED_PARAMETER(provider);
+    return -1;
+#endif
 }
 
 void
@@ -223,9 +215,6 @@ ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_f
 
     if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
 #if defined(__CHERI_PURE_CAPABILITY__)
-        if (vm->cheri_objjit_handle) {
-            return -1;
-        }
         void* jitted_mapping = vm->jitted_mapping;
         int writable_prot = PROT_READ | PROT_WRITE | PROT_CAP;
         int executable_prot = PROT_READ | PROT_EXEC | PROT_CAP;
@@ -268,9 +257,6 @@ ubpf_register_external_dispatcher(
 
     if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
 #if defined(__CHERI_PURE_CAPABILITY__)
-        if (vm->cheri_objjit_handle) {
-            return -1;
-        }
         void* jitted_mapping = vm->jitted_mapping;
         int writable_prot = PROT_READ | PROT_WRITE | PROT_CAP;
         int executable_prot = PROT_READ | PROT_EXEC | PROT_CAP;
@@ -446,15 +432,6 @@ ubpf_unload_code(struct ubpf_vm* vm)
     free(vm->local_func_stack_usage);
     vm->local_func_stack_usage = calloc(UBPF_MAX_INSTS, sizeof(struct ubpf_stack_usage));
 
-#if defined(__CHERI_PURE_CAPABILITY__)
-    if (vm->cheri_objjit_handle) {
-        dlclose(vm->cheri_objjit_handle);
-        vm->cheri_objjit_handle = NULL;
-        vm->jitted = NULL;
-        vm->jitted_mapping = NULL;
-        vm->jitted_size = 0;
-    } else
-#endif
     if (vm->jitted) {
 #if defined(__CHERI_PURE_CAPABILITY__)
         munmap(vm->jitted_mapping, vm->jitted_size);
@@ -505,6 +482,7 @@ i64(int32_t immediate)
 
 #define IS_ALIGNED(x, a) (((uintptr_t)(x) & ((a) - 1)) == 0)
 
+#if !defined(__CHERI_PURE_CAPABILITY__)
 inline static uint64_t
 ubpf_mem_load(uint64_t address, size_t size)
 {
@@ -586,6 +564,7 @@ ubpf_mem_store(uint64_t address, uint64_t value, size_t size)
         abort();
     }
 }
+#endif
 
 /**
  * @brief Mark the bits in the shadow stack corresponding to the address if it is within the stack bounds.
@@ -850,6 +829,15 @@ ubpf_exec_ex(
     uint8_t* stack_start,
     size_t stack_length)
 {
+#if defined(__CHERI_PURE_CAPABILITY__)
+    UNUSED_PARAMETER(mem);
+    UNUSED_PARAMETER(mem_len);
+    UNUSED_PARAMETER(bpf_return_value);
+    UNUSED_PARAMETER(stack_start);
+    UNUSED_PARAMETER(stack_length);
+    vm->error_printf(stderr, "Error: the scalar uBPF interpreter is unsupported on CHERI purecap; use the JIT.\n");
+    return -1;
+#else
     uint16_t pc = 0;
     const struct ebpf_inst* insts = vm->insts;
     uint64_t* reg;
@@ -1834,6 +1822,7 @@ cleanup:
         free(shadow_stack);
     }
     return return_value;
+#endif
 }
 
 int

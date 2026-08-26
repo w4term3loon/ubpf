@@ -12,8 +12,8 @@ cmake_minimum_required(VERSION 3.16)
 project("ubpf")
 
 include("cmake/platform.cmake")
-include("cmake/settings.cmake")
 include("cmake/options.cmake")
+include("cmake/settings.cmake")
 include("cmake/version.cmake")
 
 if(UBPF_ENABLE_TESTS)

@@ -125,6 +125,7 @@ static enum Registers VOLATILE_CTXT = R24;
 //              r12         Temp - used for modulus calculations
 //              r13         Temp - used for large load/store offsets
 //              r24         Saved context capability, preserved across helpers
+//              r25         Saved execution-context length, preserved across helpers
 //
 // Note that the AArch64 ABI uses r0 both for function parameters and result.  We use r5 to hold
 // the result during the function and do an extra final move at the end of the function to copy the
@@ -308,7 +309,7 @@ transfer_reg_state(struct ubpf_vm* vm, struct ebpf_inst inst, const struct Cheri
         break;
 
     case EBPF_OP_CALL:
-        out->regs[0] = (inst.src == 0 && inst.imm == vm->cheri_map_value_helper_index)
+        out->regs[0] = (inst.src == 0 && inst.imm == vm->cheri_capability_provider_index)
             ? CHERI_REG_MAP_VALUE_CAP
             : CHERI_REG_SCALAR;
         break;
@@ -633,6 +634,44 @@ emit_cheri_mov_cap(struct jit_state* state, enum Registers cd, enum Registers cn
      *   mov c0, c6 -> 0xc2c1d0c0
      */
     emit_instruction(state, 0xc2c1d000U | (cn << 5) | cd);
+}
+
+static void
+emit_cheri_capability_provider_call(
+    struct jit_state* state, ubpf_cheri_capability_provider_t provider)
+{
+    /* A capability literal load is scaled by 16 bytes, so place both the
+     * instruction and its tagged literal on a 16-byte boundary. The branch at
+     * +8 skips the embedded literal after the callback returns.
+     *
+     * Encodings verified with the Morello LLVM assembler:
+     *   ldr c16, #16 -> 0x82000030
+     *   blr c16      -> 0xc2c23200
+     */
+    while ((state->offset % 16) != 0) {
+        emit_instruction(state, 0xd503201fU); /* nop */
+    }
+
+    emit_instruction(state, 0x82000000U | (1U << 5) | R16);
+    emit_instruction(state, 0xc2c23000U | (R16 << 5));
+    emit_instruction(state, 0x14000000U | 6U);
+    emit_instruction(state, 0xd503201fU);
+
+    const uint32_t literal_size = 16;
+    if (!(literal_size <= state->size && state->offset <= state->size - literal_size)) {
+        state->jit_status = NotEnoughSpace;
+        return;
+    }
+#if defined(__CHERI_PURE_CAPABILITY__)
+    _Static_assert(sizeof(provider) == 16, "Morello function capabilities must be 16 bytes");
+    ubpf_cheri_capability_provider_t* literal =
+        __builtin_assume_aligned(state->buf + state->offset, _Alignof(ubpf_cheri_capability_provider_t));
+    *literal = provider;
+#else
+    UNUSED_PARAMETER(provider);
+    memset(state->buf + state->offset, 0, literal_size);
+#endif
+    state->offset += literal_size;
 }
 
 static void
@@ -1008,7 +1047,7 @@ emit_movewide_immediate_blinded(struct jit_state* state, bool sixty_four, enum R
 /* Generate the function prologue.
  *
  * We set the stack to look like:
- *   C29/C30 capability save area
+ *   native callee-saved capability save area
  *   bounded ubpf_stack_size bytes of eBPF stack
  *   original CSP on entry
  * Precondition: The runtime stack pointer is 16-byte aligned.
@@ -1017,42 +1056,42 @@ emit_movewide_immediate_blinded(struct jit_state* state, bool sixty_four, enum R
 static void
 emit_jit_prologue(struct jit_state* state, size_t ubpf_stack_size)
 {
-    const uint32_t frame_save_size = 128;
+    const uint32_t frame_save_size = 160;
+    assert(state->jit_mode == BasicJitMode);
     state->stack_size = frame_save_size + ubpf_stack_size;
 
-    if (state->jit_mode == BasicJitMode) {
-        /* Allocate one frame containing native callee-saved capability state and
-         * the bounded eBPF stack.
-         */
-        emit_cheri_addsub_csp_immediate(state, AS_SUB, state->stack_size);
-        emit_cheri_cap_pair_immediate(state, false, R29, R30, SP, 0);
-        emit_cheri_cap_pair_immediate(state, false, R19, R20, SP, 32);
-        emit_cheri_cap_pair_immediate(state, false, R21, R22, SP, 64);
-        emit_cheri_cap_pair_immediate(state, false, R23, VOLATILE_CTXT, SP, 96);
-        emit_cheri_mov_cap(state, R29, SP);
+    /* Allocate one frame containing native callee-saved capability state and
+     * the bounded eBPF stack.
+     */
+    emit_cheri_addsub_csp_immediate(state, AS_SUB, state->stack_size);
+    emit_cheri_cap_pair_immediate(state, false, R29, R30, SP, 0);
+    emit_cheri_cap_pair_immediate(state, false, R19, R20, SP, 32);
+    emit_cheri_cap_pair_immediate(state, false, R21, R22, SP, 64);
+    emit_cheri_cap_pair_immediate(state, false, R23, VOLATILE_CTXT, SP, 96);
+    emit_cheri_cap_pair_immediate(state, false, R25, R26, SP, 128);
+    emit_cheri_mov_cap(state, R29, SP);
 
-        /* r10 is the eBPF frame pointer: a capability to one-past the stack. */
-        emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), SP, frame_save_size);
-        emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
-        emit_cheri_scbnds_register(state, map_register(10), map_register(10), temp_register);
-        emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), map_register(10), ubpf_stack_size);
+    /* The eBPF program may overwrite r2/x1. Keep the invocation length in
+     * a native callee-saved register for capability-provider callbacks. */
+    emit_logical_register(state, true, LOG_ORR, R25, RZ, R1);
 
-        /* Clear the bounded eBPF stack so verifier-rejected uninitialized
-         * scalar stack reads cannot disclose prior native stack contents.
-         */
-        emit_cheri_addsub_cap_immediate(state, AS_SUB, offset_register, map_register(10), ubpf_stack_size);
-        emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
-        uint32_t zero_stack_loop_loc = state->offset;
-        emit_loadstore_immediate(state, LS_STRX, RZ, offset_register, 0);
-        emit_cheri_addsub_cap_immediate(state, AS_ADD, offset_register, offset_register, 8);
-        emit_addsub_immediate(state, true, AS_SUBS, temp_register, temp_register, 8);
-        DECLARE_PATCHABLE_REGULAR_JIT_TARGET(zero_stack_loop_tgt, zero_stack_loop_loc);
-        emit_conditionalbranch_immediate(state, COND_NE, zero_stack_loop_tgt);
-    } else {
-        /* Extended mode: stack passed via R2/R3 as before. */
-        emit_addsub_immediate(state, true, AS_ADD, map_register(10), R2, 0);
-        emit_addsub_register(state, true, AS_ADD, map_register(10), map_register(10), R3);
-    }
+    /* r10 is the eBPF frame pointer: a capability to one-past the stack. */
+    emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), SP, frame_save_size);
+    emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
+    emit_cheri_scbnds_register(state, map_register(10), map_register(10), temp_register);
+    emit_cheri_addsub_cap_immediate(state, AS_ADD, map_register(10), map_register(10), ubpf_stack_size);
+
+    /* Clear the bounded eBPF stack so verifier-rejected uninitialized
+     * scalar stack reads cannot disclose prior native stack contents.
+     */
+    emit_cheri_addsub_cap_immediate(state, AS_SUB, offset_register, map_register(10), ubpf_stack_size);
+    emit_movewide_immediate(state, true, temp_register, ubpf_stack_size);
+    uint32_t zero_stack_loop_loc = state->offset;
+    emit_loadstore_immediate(state, LS_STRX, RZ, offset_register, 0);
+    emit_cheri_addsub_cap_immediate(state, AS_ADD, offset_register, offset_register, 8);
+    emit_addsub_immediate(state, true, AS_SUBS, temp_register, temp_register, 8);
+    DECLARE_PATCHABLE_REGULAR_JIT_TARGET(zero_stack_loop_tgt, zero_stack_loop_loc);
+    emit_conditionalbranch_immediate(state, COND_NE, zero_stack_loop_tgt);
 
     /* Copy C0 to the volatile context for safe keeping without stripping the tag. */
     emit_cheri_mov_cap(state, VOLATILE_CTXT, R0);
@@ -1074,6 +1113,7 @@ emit_jit_epilogue(struct jit_state* state)
         emit_logical_register(state, true, LOG_ORR, R0, RZ, map_register(0));
     }
 
+    emit_cheri_cap_pair_immediate(state, true, R25, R26, SP, 128);
     emit_cheri_cap_pair_immediate(state, true, R23, VOLATILE_CTXT, SP, 96);
     emit_cheri_cap_pair_immediate(state, true, R21, R22, SP, 64);
     emit_cheri_cap_pair_immediate(state, true, R19, R20, SP, 32);
@@ -2046,14 +2086,15 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
         case EBPF_OP_CALL: {
             DECLARE_PATCHABLE_SPECIAL_TARGET(exit_tgt, Exit);
             if (inst.src == 0) {
-                if (inst.imm == vm->cheri_map_value_helper_index) {
-                    /* Experimental helper-returned object root: model a trusted
-                     * helper returning a bounded memory capability. The current
-                     * uBPF helper ABI returns uint64_t, so this deliberately
-                     * avoids pretending arbitrary helpers can return CHERI
-                     * capabilities through that scalar ABI.
+                if (inst.imm == vm->cheri_capability_provider_index) {
+                    /* Invoke the explicit purecap provider ABI. Its tagged
+                     * pointer return in C0 becomes the authority carried by
+                     * eBPF r0; the standard scalar helper ABI remains rejected.
                      */
-                    emit_cheri_mov_cap(state, map_register(0), VOLATILE_CTXT);
+                    emit_cheri_mov_cap(state, R0, VOLATILE_CTXT);
+                    emit_logical_register(state, true, LOG_ORR, R1, RZ, R25);
+                    emit_cheri_capability_provider_call(state, vm->cheri_capability_provider);
+                    emit_cheri_mov_cap(state, map_register(0), R0);
                 } else if (is_cheri_cap_invalidate_helper(vm, inst.imm)) {
                     /* Experimental protocol transition: model helpers such as
                      * ringbuf_submit/discard as ending authority for currently
@@ -2070,7 +2111,10 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
                     }
                     emit_movewide_immediate(state, true, map_register(0), 0);
                 } else {
-                    emit_dispatched_external_helper_call(state, vm, inst.imm);
+                    *errmsg = ubpf_error(
+                        "CHERI JIT does not support the scalar external-helper ABI at PC %d",
+                        i);
+                    state->jit_status = UnexpectedInstruction;
                 }
                 if (inst.imm == vm->unwind_stack_extension_index) {
                     emit_addsub_immediate(state, true, AS_SUBS, RZ, map_register(0), 0);
@@ -2257,7 +2301,7 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
             case EBPF_OP_STXDW:
                 break;
             case EBPF_OP_CALL:
-                reg_kind[0] = (inst.src == 0 && inst.imm == vm->cheri_map_value_helper_index)
+                reg_kind[0] = (inst.src == 0 && inst.imm == vm->cheri_capability_provider_index)
                     ? CHERI_REG_MAP_VALUE_CAP
                     : CHERI_REG_SCALAR;
                 break;
@@ -2315,21 +2359,6 @@ translate(struct ubpf_vm* vm, struct jit_state* state, char** errmsg)
     }
 
     emit_jit_epilogue(state);
-
-    /* CHERI M3: emit literal pool entry for eBPF stack base address.
-     * This 8-byte placeholder (0) is patched by ubpf_compile_ex
-     * with the actual stack top address after mmap'ing the stack page. */
-    if (state->jit_mode == BasicJitMode) {
-        uint8_t zero = 0;
-        int adj = (4 - (state->offset % 4)) % 4;
-        for (int i = 0; i < adj; i++) emit_bytes(state, &zero, 1);
-        state->stack_base_loc = state->offset;
-        uint64_t placeholder = 0;
-        emit_bytes(state, &placeholder, sizeof(uint64_t));
-    }
-
-    state->dispatcher_loc = emit_dispatched_external_helper_address(state, (uint64_t)vm->dispatcher);
-    state->helper_table_loc = emit_helper_table(state, vm);
 
     free(reg_states);
     return 0;
@@ -2439,8 +2468,6 @@ resolve_loads(struct jit_state* state)
         int32_t target_loc = 0;
         if (jump.target.is_special && jump.target.target.special == ExternalDispatcher) {
             target_loc = state->dispatcher_loc;
-        } else if (jump.target.is_special && jump.target.target.special == StackBase) {
-            target_loc = state->stack_base_loc;
         } else {
             return false;
         }
@@ -2498,13 +2525,10 @@ ubpf_jit_update_dispatcher_arm64_cheri(
     struct ubpf_vm* vm, external_function_dispatcher_t new_dispatcher, uint8_t* buffer, size_t size, uint32_t offset)
 {
     UNUSED_PARAMETER(vm);
-    uint64_t jit_upper_bound = (uint64_t)buffer + size;
-    void* dispatcher_address = (void*)((uint64_t)buffer + offset);
-    if ((uint64_t)dispatcher_address + sizeof(void*) < jit_upper_bound) {
-        memcpy(dispatcher_address, &new_dispatcher, sizeof(void*));
-        return true;
-    }
-
+    UNUSED_PARAMETER(new_dispatcher);
+    UNUSED_PARAMETER(buffer);
+    UNUSED_PARAMETER(size);
+    UNUSED_PARAMETER(offset);
     return false;
 }
 
@@ -2518,13 +2542,11 @@ ubpf_jit_update_helper_arm64_cheri(
     uint32_t offset)
 {
     UNUSED_PARAMETER(vm);
-    uint64_t jit_upper_bound = (uint64_t)buffer + size;
-
-    void* dispatcher_address = (void*)((uint64_t)buffer + offset + (8 * idx));
-    if ((uint64_t)dispatcher_address + sizeof(void*) < jit_upper_bound) {
-        memcpy(dispatcher_address, &new_helper, sizeof(void*));
-        return true;
-    }
+    UNUSED_PARAMETER(new_helper);
+    UNUSED_PARAMETER(idx);
+    UNUSED_PARAMETER(buffer);
+    UNUSED_PARAMETER(size);
+    UNUSED_PARAMETER(offset);
     return false;
 }
 
@@ -2535,6 +2557,11 @@ ubpf_translate_arm64_cheri(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, en
     struct ubpf_jit_result compile_result;
 
     if (initialize_jit_state_result(&state, &compile_result, buffer, *size, jit_mode, &compile_result.errmsg) < 0) {
+        goto out;
+    }
+
+    if (jit_mode != BasicJitMode) {
+        compile_result.errmsg = ubpf_error("CHERI JIT supports only the basic internal-stack ABI");
         goto out;
     }
 
@@ -2549,10 +2576,8 @@ ubpf_translate_arm64_cheri(struct ubpf_vm* vm, uint8_t* buffer, size_t* size, en
 
     compile_result.compile_result = UBPF_JIT_COMPILE_SUCCESS;
     *size = state.offset;
-    compile_result.external_dispatcher_offset = state.dispatcher_loc;
-    compile_result.external_helper_offset = state.helper_table_loc;
-    compile_result.stack_base_offset = state.stack_base_loc;
-
+    compile_result.external_dispatcher_offset = 0;
+    compile_result.external_helper_offset = 0;
 out:
     release_jit_state_result(&state, &compile_result);
     return compile_result;

@@ -40,14 +40,23 @@ add_library("ubpf"
   ebpf.h
   ubpf_instruction_valid.c
   ubpf_int.h
-  ubpf_jit_arm64.c
   ubpf_jit.c
   ubpf_jit_support.c
   ubpf_jit_support.h
-  ubpf_jit_x86_64.c
   ubpf_loader.c
   ubpf_vm.c
 )
+
+if(UBPF_ENABLE_CHERI_JIT)
+  target_sources("ubpf" PRIVATE
+    ubpf_jit_arm64_cheri.c
+  )
+else()
+  target_sources("ubpf" PRIVATE
+    ubpf_jit_arm64.c
+    ubpf_jit_x86_64.c
+  )
+endif()
 
 target_link_libraries("ubpf"
   PRIVATE

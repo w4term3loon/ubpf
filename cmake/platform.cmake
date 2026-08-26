@@ -14,4 +14,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(PLATFORM_LINUX true)
+
+elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  set(PLATFORM_FREEBSD true)
 endif()

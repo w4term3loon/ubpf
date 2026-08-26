@@ -13,7 +13,7 @@ add_library("ubpf_settings_libfuzzer" INTERFACE)
 # If we are being used as a submodule, give a chance to the parent
 # project to use the settings they want.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-  if(PLATFORM_LINUX OR PLATFORM_MACOS)
+  if(PLATFORM_LINUX OR PLATFORM_MACOS OR PLATFORM_FREEBSD)
     target_compile_options("ubpf_settings" INTERFACE
       -Wall
       -Werror
@@ -107,6 +107,12 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
   else()
     message(WARNING "ubpf - Unsupported platform")
+  endif()
+
+  if(PLATFORM_FREEBSD AND UBPF_ENABLE_CHERI_JIT)
+    # The purecap build excludes the scalar interpreter body, but its static
+    # helpers remain in ubpf_vm.c until that upstream translation unit is split.
+    target_compile_options("ubpf_settings" INTERFACE -Wno-unused-function)
   endif()
 endif()
 
